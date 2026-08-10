@@ -145,7 +145,7 @@ def run_screen_and_notify(cfg: AppConfig, db: Database, *, dry_run: bool = False
         f"モード: {'擬似発注' if not cfg.execution.live_trading else '⚠️実発注'}"
     )
 
-    if dry_run or not cfg.line.configured:
+    if dry_run or not cfg.line.can_push:
         print(console.render(accepted, header_text=header, warnings=warnings))
     else:
         LineNotifier(cfg.line).push_signals(accepted, header_text=header, warnings=warnings)

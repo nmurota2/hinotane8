@@ -173,7 +173,8 @@ class LineNotifier:
 
     @property
     def enabled(self) -> bool:
-        return self.cfg.configured
+        """push を送れるか。宛先 userId が未登録なら送れない。"""
+        return self.cfg.can_push
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -235,8 +236,12 @@ class LineNotifier:
         return ok
 
     def reply_text(self, reply_token: str, text: str) -> bool:
-        """ユーザー操作への返信。push と違い課金対象外。"""
-        if not self.enabled:
+        """ユーザー操作への返信。push と違い課金対象外。
+
+        宛先 userId が未登録でも返信はできる（セットアップ中に
+        「あなたの userId はこれです」と返すため）。
+        """
+        if not self.cfg.configured:
             return False
         return self._post(
             REPLY_URL,

@@ -2,6 +2,8 @@
 
 よく使う順:
     hinotane init                     初期化（DB 作成）
+    hinotane doctor                   設定の健康診断（まずこれ）
+    hinotane line-test                LINE にテスト送信
     hinotane backfill --years 2       過去データの一括取得（初回のみ・数十分）
     hinotane fetch                    日次の株価更新
     hinotane screen --dry-run         スクリーニング結果を画面に表示（LINE に送らない）
@@ -40,21 +42,50 @@ def cmd_init(args, cfg, db) -> int:
 
 
 def cmd_doctor(args, cfg, db) -> int:
-    """設定が正しいかを一通りチェックする。最初に必ずこれを実行する。"""
+    """設定が正しいかを一通りチェックする。最初に必ずこれを実行する。
+
+    既定では実際に J-Quants API を 1 回叩いて、鍵が本当に通るかまで確かめる。
+    「設定してあるのに動かない」の大半はここで判明する。
+    """
     ok = True
     print("=== 設定の健康診断 ===\n")
 
-    if cfg.jquants.configured:
-        mode = "APIキー (V2)" if cfg.jquants.auth_mode == "apikey" else "トークン (V1)"
-        print(f"✅ J-Quants: 設定済み（認証方式: {mode}）")
-    else:
-        print("❌ J-Quants: 未設定。JQUANTS_API_KEY か メール+パスワードを .env に設定してください")
+    # --- J-Quants -----------------------------------------------------
+    if not cfg.jquants.configured:
+        print("❌ J-Quants: 未設定")
+        print("     .env に JQUANTS_API_KEY（V2）を設定してください。")
+        print("     V1 の場合は JQUANTS_MAIL_ADDRESS + JQUANTS_PASSWORD。")
         ok = False
-
-    if cfg.line.configured:
-        print(f"✅ LINE: 設定済み（宛先 {len(cfg.line.allowed_user_ids)} 件）")
     else:
+        mode = "APIキー (V2)" if cfg.jquants.auth_mode == "apikey" else "トークン (V1)"
+        if args.offline:
+            print(f"✅ J-Quants: 設定あり（認証方式: {mode}）※接続確認はスキップ")
+        else:
+            from .datasource.jquants import JQuantsClient
+
+            try:
+                listed = JQuantsClient(cfg.jquants).listed_info()
+                print(f"✅ J-Quants: 接続成功（認証方式: {mode} / {len(listed):,} 銘柄）")
+            except Exception as exc:
+                print(f"❌ J-Quants: 接続失敗（認証方式: {mode}）")
+                print(f"     {exc}")
+                print("     → キーの打ち間違い、またはダッシュボードでプラン選択が")
+                print("       未完了の可能性があります（Free プランでも選択が必要）。")
+                ok = False
+
+    # --- LINE ---------------------------------------------------------
+    if not cfg.line.configured:
         print("⚠️  LINE: 未設定。通知は画面出力のみになります")
+        print("     LINE_CHANNEL_ACCESS_TOKEN と LINE_CHANNEL_SECRET を設定してください。")
+    elif cfg.line.setup_mode:
+        print("🔧 LINE: セットアップモード（宛先 userId が未登録）")
+        print("     LINE Developers コンソール →「チャネル基本設定」タブ →")
+        print("     『あなたのユーザーID』をコピーして、.env の")
+        print("     LINE_ALLOWED_USER_IDS に貼り付けてください。")
+        print("     （分からなければ `hinotane serve` を起動して Bot に話しかけると返信で教えます）")
+    else:
+        print(f"✅ LINE: 設定済み（宛先 {len(cfg.line.allowed_user_ids)} 件）")
+        print("     → `hinotane line-test` で実際にメッセージが届くか試せます")
 
     try:
         db.init_schema()
@@ -91,6 +122,34 @@ def cmd_doctor(args, cfg, db) -> int:
         print("\n🛡️  擬似発注モード（実際のお金は動きません）")
 
     return 0 if ok else 1
+
+
+def cmd_line_test(args, cfg, db) -> int:
+    """LINE に実際にテストメッセージを送って、届くかを確かめる。"""
+    from .notify.line import LineNotifier
+
+    if not cfg.line.configured:
+        print("❌ LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET が未設定です")
+        return 1
+    if cfg.line.setup_mode:
+        print("❌ LINE_ALLOWED_USER_IDS が未設定のため送信先がありません")
+        print("   LINE Developers →「チャネル基本設定」→『あなたのユーザーID』を")
+        print("   .env の LINE_ALLOWED_USER_IDS に設定してください。")
+        return 1
+
+    ok = LineNotifier(cfg.line).push_text(
+        "✅ hinotane の接続テストです。\n"
+        "このメッセージが届いていれば通知の設定は完了しています。\n\n"
+        "試しに「状況」と送ってみてください。"
+    )
+    if ok:
+        print(f"✅ 送信しました（宛先 {len(cfg.line.allowed_user_ids)} 件）。LINE を確認してください。")
+        return 0
+    print("❌ 送信に失敗しました。よくある原因:")
+    print("   ・アクセストークンが間違っている（発行し直すと古いトークンは無効になります）")
+    print("   ・userId が別のチャネルのもの")
+    print("   ・Bot を友だち追加していない")
+    return 1
 
 
 def cmd_fetch(args, cfg, db) -> int:
@@ -204,7 +263,14 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="データベースを初期化").set_defaults(func=cmd_init)
-    sub.add_parser("doctor", help="設定の健康診断").set_defaults(func=cmd_doctor)
+
+    d = sub.add_parser("doctor", help="設定の健康診断")
+    d.add_argument("--offline", action="store_true", help="外部APIへの接続確認をスキップ")
+    d.set_defaults(func=cmd_doctor)
+
+    sub.add_parser("line-test", help="LINE にテストメッセージを送る").set_defaults(
+        func=cmd_line_test
+    )
 
     f = sub.add_parser("fetch", help="日次の株価更新")
     f.add_argument("--days", type=int, default=10, help="何日前まで取得するか")

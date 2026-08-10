@@ -30,8 +30,7 @@ OWNER = "Uowner00000000000000000000000000"
 STRANGER = "Ustranger000000000000000000000000"
 
 
-@pytest.fixture
-def client(tmp_path, monkeypatch):
+def _make_client(tmp_path, monkeypatch, *, allowed: list[str]):
     db_path = tmp_path / "wh.duckdb"
     database = Database(db_path)
     database.init_schema()
@@ -52,7 +51,7 @@ def client(tmp_path, monkeypatch):
         line=LineConfig(
             channel_access_token="token",
             channel_secret=SECRET,
-            allowed_user_ids=[OWNER],
+            allowed_user_ids=allowed,
         ),
         risk=RiskConfig(),
         screener=ScreenerConfig(),
@@ -62,10 +61,27 @@ def client(tmp_path, monkeypatch):
     import hinotane.webhook as wh
 
     monkeypatch.setattr(wh, "load_config", lambda: fake_cfg)
-    # 実際に LINE へ通信しないようにする
-    monkeypatch.setattr(wh.LineNotifier, "reply_text", lambda self, token, text: True)
+    # 実際に LINE へ通信せず、返信内容を記録するだけにする
+    replies: list[str] = []
 
-    yield TestClient(wh.create_app()), database
+    def fake_reply(self, token, text):
+        replies.append(text)
+        return True
+
+    monkeypatch.setattr(wh.LineNotifier, "reply_text", fake_reply)
+    return TestClient(wh.create_app()), database, replies
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    c, database, _ = _make_client(tmp_path, monkeypatch, allowed=[OWNER])
+    yield c, database
+
+
+@pytest.fixture
+def setup_client(tmp_path, monkeypatch):
+    """宛先 userId が未登録＝セットアップモードのクライアント。"""
+    yield _make_client(tmp_path, monkeypatch, allowed=[])
 
 
 def _post(client, body: dict, *, secret: str | None = SECRET):
@@ -149,6 +165,57 @@ def test_expired_signal_cannot_be_approved(client):
     )
     _post(c, _postback(OWNER, "approve"))
     assert db.query("SELECT status FROM signals").iloc[0]["status"] == "expired"
+
+
+def test_setup_mode_replies_with_user_id(setup_client):
+    """宛先未登録のうちは、話しかけると userId を教え返す。"""
+    c, _, replies = setup_client
+    body = {
+        "events": [
+            {
+                "type": "message",
+                "replyToken": "rt",
+                "source": {"userId": STRANGER, "type": "user"},
+                "message": {"type": "text", "text": "こんにちは"},
+            }
+        ]
+    }
+    assert _post(c, body).status_code == 200
+    assert len(replies) == 1
+    assert STRANGER in replies[0]
+    assert "LINE_ALLOWED_USER_IDS" in replies[0]
+
+
+def test_setup_mode_never_executes_approvals(setup_client):
+    """セットアップモード中は、誰が承認ボタンを押しても状態が変わらないこと。
+
+    userId を教え返す都合で誰でも話しかけられる状態なので、
+    ここで承認が通ってしまうと第三者に発注させられる。
+    """
+    c, db, replies = setup_client
+    assert _post(c, _postback(STRANGER, "approve")).status_code == 200
+    assert _post(c, _postback(OWNER, "approve")).status_code == 200
+
+    assert db.query("SELECT status FROM signals").iloc[0]["status"] == "pending"
+    assert db.query("SELECT count(*) AS n FROM approvals").iloc[0]["n"] == 0
+    # 返ってきたのは userId の案内だけ
+    assert all("セットアップモード" in r for r in replies)
+
+
+def test_setup_mode_still_verifies_signature(setup_client):
+    c, _, replies = setup_client
+    body = {
+        "events": [
+            {
+                "type": "message",
+                "replyToken": "rt",
+                "source": {"userId": STRANGER, "type": "user"},
+                "message": {"type": "text", "text": "こんにちは"},
+            }
+        ]
+    }
+    assert _post(c, body, secret="wrong-secret").status_code == 403
+    assert replies == []
 
 
 def test_text_stop_command_cancels_pending_signals(client):

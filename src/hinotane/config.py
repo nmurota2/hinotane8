@@ -110,7 +110,22 @@ class LineConfig:
 
     @property
     def configured(self) -> bool:
-        return bool(self.channel_access_token and self.channel_secret and self.allowed_user_ids)
+        """LINE と通信できるか（返信だけなら宛先の登録は不要）。"""
+        return bool(self.channel_access_token and self.channel_secret)
+
+    @property
+    def can_push(self) -> bool:
+        """こちらから通知を送れるか。宛先 userId の登録が必須。"""
+        return self.configured and bool(self.allowed_user_ids)
+
+    @property
+    def setup_mode(self) -> bool:
+        """トークンはあるが宛先 userId が未登録の状態。
+
+        この間、Bot は「あなたの userId はこれです」とだけ返し、
+        承認などの操作は一切受け付けない。userId を調べるための一時的な状態。
+        """
+        return self.configured and not self.allowed_user_ids
 
 
 @dataclass(frozen=True)

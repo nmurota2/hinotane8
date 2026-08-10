@@ -62,7 +62,23 @@ def _handle_event(cfg: AppConfig, db: Database, notifier: LineNotifier, event: d
     user_id = (event.get("source") or {}).get("userId", "")
     reply_token = event.get("replyToken", "")
 
-    if cfg.line.allowed_user_ids and user_id not in cfg.line.allowed_user_ids:
+    # --- セットアップモード ------------------------------------------------
+    # 宛先 userId が未登録のうちは、userId を教え返すことしかしない。
+    # 承認などの操作は一切受け付けないので、この状態で第三者に
+    # 勝手に発注されることはない。
+    if cfg.line.setup_mode:
+        log.warning("【セットアップ】あなたの userId: %s", user_id)
+        notifier.reply_text(
+            reply_token,
+            "🔧 セットアップモードです\n\n"
+            "あなたの userId は以下です。これを .env の\n"
+            "LINE_ALLOWED_USER_IDS に貼り付けて再起動してください。\n\n"
+            f"{user_id}\n\n"
+            "登録が済むと、毎晩の候補通知と承認ボタンが有効になります。",
+        )
+        return
+
+    if user_id not in cfg.line.allowed_user_ids:
         log.warning("許可されていない userId からの操作を無視: %s", user_id[:8])
         return
 
