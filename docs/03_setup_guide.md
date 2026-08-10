@@ -53,6 +53,14 @@ B は「通知の中身に納得できたら」で構いません。
 
 ### 1-4. `.env` に貼る
 
+**セットアップスクリプトを使うのが一番楽です**（キーは画面に表示されません）。
+
+```bash
+bash scripts/setup.sh
+```
+
+手動でやる場合は `.env` を開いて直接書きます。
+
 ```dotenv
 JQUANTS_API_KEY=ここに貼り付け
 ```
@@ -68,8 +76,12 @@ JQUANTS_API_KEY=ここに貼り付け
 ### 1-5. 動作確認
 
 ```bash
+source .venv/bin/activate    # 毎回、作業前にこれを実行します
 hinotane doctor
 ```
+
+> `hinotane: command not found` と出たら、上の `source` を忘れています。
+> 面倒なら `.venv/bin/hinotane doctor` とフルパスで書いても同じです。
 
 ```
 ✅ J-Quants: 接続成功（認証方式: APIキー (V2) / 4,412 銘柄）
@@ -258,7 +270,9 @@ https://取得したドメイン/line/webhook
 
 | 症状 | 原因として多いもの |
 |---|---|
-| `hinotane doctor` で J-Quants が ❌ | **プラン選択（1-2）が未完了**。次にキーの貼り間違い |
+| `doctor` が「認証に失敗しました」 | **プラン選択（1-2）が未完了**が最多。次にキーの貼り間違い |
+| `doctor` が「サーバーに接続できませんでした」 | 設定ではなくネットワーク側。VPN / 社内プロキシ / 回線を確認 |
+| `hinotane: command not found` | 仮想環境が有効になっていない。`source .venv/bin/activate` するか `.venv/bin/hinotane …` と書く |
 | 「必須カラムを特定できませんでした」 | J-Quants のレスポンス形式が想定と違う。**エラーに実際のカラム一覧が出るので、それを送ってください**。対応表に1行足せば直ります |
 | `line-test` が ❌ | ①Bot を友だち追加していない ②トークンを再発行して古いのを貼っている ③userId が別チャネルのもの |
 | LINE に通知が来ない | `LINE_ALLOWED_USER_IDS` が空（未設定だと送信されません） |

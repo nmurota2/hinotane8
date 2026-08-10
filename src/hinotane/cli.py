@@ -61,16 +61,37 @@ def cmd_doctor(args, cfg, db) -> int:
         if args.offline:
             print(f"✅ J-Quants: 設定あり（認証方式: {mode}）※接続確認はスキップ")
         else:
-            from .datasource.jquants import JQuantsClient
+            from .datasource.jquants import (
+                JQuantsAuthError,
+                JQuantsClient,
+                JQuantsNetworkError,
+            )
 
             try:
                 listed = JQuantsClient(cfg.jquants).listed_info()
                 print(f"✅ J-Quants: 接続成功（認証方式: {mode} / {len(listed):,} 銘柄）")
-            except Exception as exc:
-                print(f"❌ J-Quants: 接続失敗（認証方式: {mode}）")
+            except JQuantsAuthError as exc:
+                # 設定の問題。「アカウントは作ったのに動かない」の大半はプラン未選択。
+                print(f"❌ J-Quants: 認証に失敗しました（認証方式: {mode}）")
                 print(f"     {exc}")
-                print("     → キーの打ち間違い、またはダッシュボードでプラン選択が")
-                print("       未完了の可能性があります（Free プランでも選択が必要）。")
+                print("     考えられる原因を可能性の高い順に:")
+                print("     1. ダッシュボードでプラン選択が未完了")
+                print("        （Free プランでも「選択」の操作が必要です）")
+                print("     2. API キーの貼り間違い・コピー漏れ")
+                print("     3. キーを再発行して古いものが残っている")
+                ok = False
+            except JQuantsNetworkError as exc:
+                # 到達性の問題。設定を疑わせない。
+                print("❌ J-Quants: サーバーに接続できませんでした")
+                print(f"     {exc}")
+                print("     設定ではなくネットワーク側の問題です:")
+                print("     ・インターネットに繋がっているか")
+                print("     ・社内プロキシ / VPN / ファイアウォールで遮断されていないか")
+                print("     ・J-Quants 側が一時的に落ちていないか")
+                ok = False
+            except Exception as exc:
+                print(f"❌ J-Quants: 予期しないエラー（認証方式: {mode}）")
+                print(f"     {exc}")
                 ok = False
 
     # --- LINE ---------------------------------------------------------

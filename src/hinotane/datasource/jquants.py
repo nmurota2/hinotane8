@@ -48,7 +48,22 @@ _LISTED_COLUMNS: dict[str, tuple[str, ...]] = {
 
 
 class JQuantsError(RuntimeError):
-    pass
+    """J-Quants API の呼び出しに失敗した。"""
+
+
+class JQuantsAuthError(JQuantsError):
+    """認証に失敗した。キーの誤り、またはプラン未選択が原因。
+
+    「アカウントは作ったのに動かない」の大半は、ダッシュボードでの
+    プラン選択（Free でも必要）が終わっていないケース。
+    """
+
+
+class JQuantsNetworkError(JQuantsError):
+    """API に到達できなかった。ネットワーク・DNS・プロキシ・障害など。
+
+    設定の問題ではないので、ユーザーに設定を疑わせないよう区別する。
+    """
 
 
 def _normalize(df: pd.DataFrame, mapping: dict[str, tuple[str, ...]], required: set[str]) -> pd.DataFrame:
@@ -118,7 +133,9 @@ class JQuantsClient:
                 timeout=self.cfg.timeout_sec,
             )
             if resp.status_code != 200:
-                raise JQuantsError(f"リフレッシュトークンの取得に失敗: {resp.status_code} {resp.text[:300]}")
+                raise JQuantsAuthError(
+                    f"リフレッシュトークンの取得に失敗: {resp.status_code} {resp.text[:300]}"
+                )
             refresh_token = resp.json()["refreshToken"]
 
         resp = self._session.post(
@@ -127,7 +144,7 @@ class JQuantsClient:
             timeout=self.cfg.timeout_sec,
         )
         if resp.status_code != 200:
-            raise JQuantsError(f"ID トークンの取得に失敗: {resp.status_code} {resp.text[:300]}")
+            raise JQuantsAuthError(f"ID トークンの取得に失敗: {resp.status_code} {resp.text[:300]}")
         self._id_token = resp.json()["idToken"]
         # ID トークンの寿命は 24 時間。余裕を持って 20 時間で切る。
         self._id_token_expires_at = datetime.now() + timedelta(hours=20)
@@ -159,29 +176,51 @@ class JQuantsClient:
 
     def _get_with_retry(self, url: str, params: dict) -> dict:
         last_err: str = ""
+        network_failure = False
+        auth_failure = False
+
         for attempt in range(self.cfg.max_retries):
             try:
                 resp = self._session.get(
                     url, params=params, headers=self._headers(), timeout=self.cfg.timeout_sec
                 )
             except requests.RequestException as exc:
+                # DNS・プロキシ・タイムアウトなど。設定ではなく到達性の問題。
+                network_failure = True
                 last_err = str(exc)
                 time.sleep(2**attempt)
                 continue
 
+            network_failure = False
+
             if resp.status_code == 200:
                 return resp.json()
-            if resp.status_code in (401, 403) and self.cfg.auth_mode == "token":
-                # ID トークン失効。作り直して 1 回だけやり直す。
-                self._id_token = None
+
+            if resp.status_code in (401, 403):
+                auth_failure = True
                 last_err = f"{resp.status_code} {resp.text[:200]}"
-                continue
+                if self.cfg.auth_mode == "token":
+                    # ID トークン失効の可能性があるので、作り直して再試行する
+                    self._id_token = None
+                    continue
+                # API キー方式では再試行しても結果は変わらない
+                raise JQuantsAuthError(
+                    f"認証に失敗しました（{resp.status_code}）: {resp.text[:200]}"
+                )
+
             if resp.status_code in (429, 500, 502, 503, 504):
                 last_err = f"{resp.status_code} {resp.text[:200]}"
                 time.sleep(2**attempt)
                 continue
+
             raise JQuantsError(f"J-Quants API エラー {resp.status_code}: {resp.text[:300]}")
 
+        if network_failure:
+            raise JQuantsNetworkError(
+                f"J-Quants API に接続できませんでした（{self.cfg.max_retries} 回試行）: {last_err}"
+            )
+        if auth_failure:
+            raise JQuantsAuthError(f"認証に失敗しました: {last_err}")
         raise JQuantsError(f"J-Quants API に {self.cfg.max_retries} 回失敗しました: {last_err}")
 
     # ------------------------------------------------------------------ 公開 API

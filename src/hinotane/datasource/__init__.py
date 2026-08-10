@@ -1,3 +1,15 @@
-from .jquants import JQuantsClient, JQuantsError, display_code
+from .jquants import (
+    JQuantsAuthError,
+    JQuantsClient,
+    JQuantsError,
+    JQuantsNetworkError,
+    display_code,
+)
 
-__all__ = ["JQuantsClient", "JQuantsError", "display_code"]
+__all__ = [
+    "JQuantsAuthError",
+    "JQuantsClient",
+    "JQuantsError",
+    "JQuantsNetworkError",
+    "display_code",
+]

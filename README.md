@@ -77,19 +77,30 @@ git clone <このリポジトリのURL> hinotane
 cd hinotane
 ```
 
-### 2-2. Python 環境を作る
+### 2-2. セットアップスクリプトを実行する（推奨・macOS / Linux / VPS）
+
+```bash
+bash scripts/setup.sh
+```
+
+Python 環境の作成 → パッケージ導入 → `.env` 生成 → API キーの入力 → 動作確認 までを
+一度にやります。**API キーは入力中も画面に表示されず、`.env` にだけ保存されます。**
+何度実行しても壊れないので、設定を変えたいときは再実行してください。
+
+これが通ったら **2-5 へ進んでください**（2-3 と 2-4 は手動でやる場合の手順です）。
+
+<details>
+<summary>手動でやる場合／Windows の場合</summary>
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate          # Windows は .venv\Scripts\activate
 pip install -e ".[dev]"
+cp .env.example .env               # Windows は copy .env.example .env
 ```
+</details>
 
-### 2-3. 設定ファイルを作る
-
-```bash
-cp .env.example .env
-```
+### 2-3. 設定ファイルを編集する
 
 `.env` をエディタで開いて、次の 3 か所だけ埋めます。
 
