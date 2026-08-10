@@ -1,0 +1,16 @@
+# hinotane バッチスケジュール（コンテナ内 TZ = Asia/Tokyo）
+#
+#  16:00  fetch    引け後の日足を取得
+#  16:10  mark     建玉の損切り・利確・時間切れを判定して決済
+#  21:00  screen   スクリーニング → LINE に候補を配信
+#  08:50  execute  承認済みシグナルを発注（翌営業日の寄り付き前）
+#
+# 平日のみ動かす（月〜金 = 1-5）。祝日は J-Quants にデータが無く空振りするだけなので無害。
+
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ 0 16 * * 1-5 cd /app && hinotane fetch   >> /app/logs/fetch.log   2>&1
+10 16 * * 1-5 cd /app && hinotane mark    >> /app/logs/mark.log    2>&1
+ 0 21 * * 1-5 cd /app && hinotane screen  >> /app/logs/screen.log  2>&1
+50  8 * * 1-5 cd /app && hinotane execute >> /app/logs/execute.log 2>&1

@@ -1,0 +1,50 @@
+"""時刻まわりの回帰テスト。
+
+VPS のシステム時刻が UTC のままでも、承認の有効期限が 9 時間ずれないこと。
+ここが壊れると「夜に承認したのに翌朝の執行時点で期限切れ」という
+静かな事故が起きるので、テストで固定しておく。
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from hinotane.config import JST, now, today
+
+
+@pytest.fixture
+def utc_host():
+    """ホストのタイムゾーンを UTC に切り替える（VPS 初期状態の再現）。"""
+    original = os.environ.get("TZ")
+    os.environ["TZ"] = "UTC"
+    time.tzset()
+    yield
+    if original is None:
+        del os.environ["TZ"]
+    else:
+        os.environ["TZ"] = original
+    time.tzset()
+
+
+def test_now_returns_jst_wall_clock_even_on_utc_host(utc_host):
+    expected = datetime.now(JST).replace(tzinfo=None)
+    assert abs(now() - expected) < timedelta(seconds=2)
+
+
+def test_now_is_ahead_of_utc_by_nine_hours(utc_host):
+    utc_naive = datetime.now(UTC).replace(tzinfo=None)
+    delta = now() - utc_naive
+    assert timedelta(hours=8, minutes=59) < delta < timedelta(hours=9, minutes=1)
+
+
+def test_now_is_naive_so_it_compares_with_duckdb_timestamps():
+    # DuckDB の TIMESTAMP 列は naive で返るため、aware だと比較で TypeError になる
+    assert now().tzinfo is None
+
+
+def test_today_matches_jst_date(utc_host):
+    assert today() == datetime.now(JST).date()

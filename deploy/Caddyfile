@@ -1,0 +1,19 @@
+# HTTPS 終端。Let's Encrypt の証明書を自動で取得・更新する。
+# LINE の Webhook は HTTPS 必須なので、この 5 行が実質的に必須設定。
+
+{$DOMAIN} {
+	encode gzip
+
+	# LINE からの Webhook だけを通す。他のパスは 404。
+	handle /line/* {
+		reverse_proxy app:8080
+	}
+
+	handle /healthz {
+		reverse_proxy app:8080
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

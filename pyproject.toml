@@ -1,0 +1,52 @@
+[project]
+name = "hinotane"
+version = "0.1.0"
+description = "日本株スイングトレードの半自動化システム（夜間LINE通知 → 承認 → 発注）"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.32",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "duckdb>=1.1",
+    "python-dotenv>=1.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.7",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+hinotane = "hinotane.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "G", "RUF"]
+ignore = [
+    # 日本語コメントの都合で行長が揺れるケースを許容
+    "E501",
+    # 全角記号（＋ ／ 〜 など）を「紛らわしい文字」として警告する規則。
+    # 日本語で書いているコードベースなので無効化する。
+    "RUF001", "RUF002", "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
