@@ -29,15 +29,27 @@ step() { printf "\n%s── %s ──%s\n" "$BOLD" "$*" "$RESET"; }
 # --------------------------------------------------------------- 1. Python
 step "1/5 Python を確認します"
 
+# 動作確認済みの範囲は 3.11〜3.14。
+# 3.15 以降は pandas / duckdb の macOS 向けビルドがまだ揃っておらず、
+# インストール時にソースからのコンパイルが走って失敗しやすいため優先度を下げる。
 PYTHON=""
-for candidate in python3.13 python3.12 python3.11 python3; do
+for candidate in python3.13 python3.14 python3.12 python3.11; do
     if command -v "$candidate" >/dev/null 2>&1; then
-        if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
-            PYTHON="$candidate"
-            break
-        fi
+        PYTHON="$candidate"
+        break
     fi
 done
+
+# 上記で見つからなければ python3 を見る（要件を満たすかは実際に確認する）
+if [ -z "$PYTHON" ] && command -v python3 >/dev/null 2>&1; then
+    if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+        PYTHON="python3"
+        if ! python3 -c 'import sys; sys.exit(0 if sys.version_info < (3, 15) else 1)' 2>/dev/null; then
+            warn "$(python3 -V) は動作確認範囲（3.11〜3.14）の外です。"
+            warn "パッケージの導入に失敗する場合は Python 3.13 を入れ直してください。"
+        fi
+    fi
+fi
 
 if [ -z "$PYTHON" ]; then
     err "Python 3.11 以上が見つかりませんでした。"
@@ -47,9 +59,10 @@ if [ -z "$PYTHON" ]; then
         say ""
         say "  ${BOLD}いちばん簡単な入れ方（ターミナル不要）:${RESET}"
         say "    1. https://www.python.org/downloads/macos/ を開く"
-        say "    2. 「Latest Python 3 Release」の macOS 64-bit universal2 installer を取得"
-        say "    3. ダウンロードした .pkg をダブルクリックして、指示どおり進めるだけ"
-        say "    4. 終わったらターミナルを一度閉じて開き直し、このコマンドを再実行"
+        say "    2. 「Stable Releases」から ${BOLD}Python 3.13 系${RESET} を探す"
+        say "    3. その下の「macOS 64-bit universal2 installer」をダウンロード"
+        say "    4. .pkg をダブルクリックして、指示どおり進めるだけ"
+        say "    5. 終わったらターミナルを一度閉じて開き直し、このコマンドを再実行"
         say ""
         say "  （Homebrew を使い慣れている場合は brew install python@3.12 でも可）"
     else
