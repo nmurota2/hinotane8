@@ -42,8 +42,20 @@ done
 if [ -z "$PYTHON" ]; then
     err "Python 3.11 以上が見つかりませんでした。"
     say ""
-    say "  macOS  : brew install python@3.12"
-    say "  Ubuntu : sudo apt update && sudo apt install -y python3.12 python3.12-venv"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        say "  ${BOLD}macOS に最初から入っている Python は 3.9 系で、この先の処理には足りません。${RESET}"
+        say ""
+        say "  ${BOLD}いちばん簡単な入れ方（ターミナル不要）:${RESET}"
+        say "    1. https://www.python.org/downloads/macos/ を開く"
+        say "    2. 「Latest Python 3 Release」の macOS 64-bit universal2 installer を取得"
+        say "    3. ダウンロードした .pkg をダブルクリックして、指示どおり進めるだけ"
+        say "    4. 終わったらターミナルを一度閉じて開き直し、このコマンドを再実行"
+        say ""
+        say "  （Homebrew を使い慣れている場合は brew install python@3.12 でも可）"
+    else
+        say "  Ubuntu / Debian : sudo apt update && sudo apt install -y python3.12 python3.12-venv"
+        say "  その他          : https://www.python.org/downloads/"
+    fi
     say ""
     exit 1
 fi
