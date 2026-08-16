@@ -126,6 +126,37 @@ class BacktestResult:
         """
         return self.final_equity - self.initial_equity
 
+    def expectancy_ci(
+        self, *, confidence: float = 0.95, n_boot: int = 2000, seed: int = 12345
+    ) -> tuple[float, float]:
+        """期待値の信頼区間をブートストラップで求める。
+
+        点推定の +0.14R が「本当に優位性がある」のか「たまたまそう出た」のかは、
+        数字ひとつでは区別できない。取引を復元抽出し直して期待値を作り直す作業を
+        繰り返し、そのばらつきを見る。**区間がゼロをまたぐなら、優位性は
+        偶然と区別できていない。**
+
+        ⚠️ この区間は楽観的すぎる。同時に複数の建玉を持つので取引同士が独立でなく、
+        同じ相場の動きを共有している。実際のばらつきはこれより大きい。
+        """
+        if not self.trades:
+            return (0.0, 0.0)
+        pnl = np.array([t.pnl_jpy for t in self.trades], dtype=float)
+        risk = np.array([t.risk_jpy for t in self.trades], dtype=float)
+        if risk.sum() <= 0:
+            return (0.0, 0.0)
+        rng = np.random.default_rng(seed)
+        idx = rng.integers(0, len(pnl), size=(n_boot, len(pnl)))
+        boot_risk = risk[idx].sum(axis=1)
+        boot = np.divide(
+            pnl[idx].sum(axis=1),
+            boot_risk,
+            out=np.zeros(n_boot),
+            where=boot_risk > 0,
+        )
+        tail = (1.0 - confidence) / 2.0 * 100
+        return float(np.percentile(boot, tail)), float(np.percentile(boot, 100 - tail))
+
     @property
     def carried_in_trades(self) -> int:
         """この期間より前に建てられた建玉の件数。
@@ -764,17 +795,27 @@ FAIL = "FAIL"
 UNDETERMINED = "UNDETERMINED"
 
 
+
+
 def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
     """検証結果から合否を出す。返り値は PASS / FAIL / UNDETERMINED。
 
-    **「判定できなかった」を合格側に倒さない。** これが設計の要。
-    bool を返していた頃は、標本不足で検査できなかった項目があっても
-    ✅ が出た。✅ は「実運用に載せてよい」という合図として読まれるので、
-    未検査を ✅ に混ぜるのは、注意書きを添えたところで免罪符にしかならない。
+    設計の要は 3 つ。
 
-    **お金が増えていないものは、何があっても合格にしない。**
+    **1. 「判定できなかった」を合格側に倒さない。**
+    bool を返していた頃は、標本不足で検査できなかった項目があっても ✅ が出た。
+    ✅ は「実運用に載せてよい」という合図として読まれるので、
+    未検査を ✅ に混ぜるのは注意書きを添えたところで免罪符にしかならない。
+
+    **2. お金が増えていないものは、何があっても合格にしない。**
     期待値（R）はリスク額で割った比率なので、取引ごとにリスク額がばらつくと
     円の損益と符号が食い違いうる。最終的な判断はお金で行う。
+
+    **3. 買い持ちに勝てないものは合格にしない。**
+    この判定は「実弾を入れるか」を決めるためのもの。同じ銘柄を買って放って
+    おくほうが成績が良いなら、わざわざ毎日売買する理由がない。
+    以前は警告に留めていたため、「買い持ちに負けています」と表示した 2 行あとに
+    ✅ を出すという自己矛盾が起きた（実測で発生）。
 
     Returns:
         (PASS | FAIL | UNDETERMINED, 表示する行のリスト)
@@ -785,12 +826,26 @@ def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
     if not out_s.trades:
         return UNDETERMINED, ["⚠️  アウトオブサンプルで取引が発生せず、判断できません。"]
 
-    # ---------------------------------------------------------- お金の検査
+    # 前半の標本が判定に足りているか。**取引数ではなく期間の構造** で決める。
+    # 取引数は回してみないと分からない出力なので、それを条件にすると
+    # 「たまたま取引が少なかった」あらゆる戦略が検査を回避できてしまう。
+    needed = report.max_holding_days * 2
+    blockers: list[str] = []
+    if report.in_window_days < needed:
+        blockers.append(
+            f"前半の売買可能期間が {report.in_window_days} 営業日しかなく、"
+            f" 最大保有 {report.max_holding_days} 日の売買が 1 巡もしません"
+            f"（{needed} 営業日以上必要）"
+        )
+    if len(in_s.trades) < 30:
+        blockers.append(f"前半の取引が {len(in_s.trades)} 件しかなく、期待値を推定できません")
+
     failures: list[str] = []
-    # ⚠️ 判定に使うのは period_pnl_jpy（口座が実際に増減した額）。
+
+    # ------------------------------------------------------------ お金の検査
+    # 判定に使うのは period_pnl_jpy（口座が実際に増減した額）。
     # net_pnl_jpy（決済した取引の合計）を使うと、前半で積み上がった含み益を
     # 後半に決済しただけで「後半も稼いだ」ことになってしまう。
-    # 実際に起きた: 後半の決済損益 +72,852 円に対し、口座の増加は +1,215 円。
     if out_s.period_pnl_jpy <= 0:
         failures.append(
             f"アウトオブサンプルで資産が減っています"
@@ -804,42 +859,47 @@ def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
             f"\n    後半に建てた取引がどれだけ稼いだかは、この数字からは分かりません"
             f"（{out_s.carried_in_trades} 件が前半からの持ち越し）。"
         )
-    if out_s.expectancy_r <= 0:
-        failures.append(f"アウトオブサンプルの期待値がマイナスです（{out_s.expectancy_r:+.2f} R）")
+
     if out_s.profit_factor <= 1.0:
         failures.append(
             f"アウトオブサンプルのプロフィットファクターが 1 以下です"
             f"（{out_s.profit_factor:.2f}）＝ 損失が利益を上回っています"
         )
 
-    # 買い持ちに、リターンでもドローダウンでも負けているなら、
-    # わざわざ売買する理由がない（買って放っておくほうが良い）。
+    # -------------------------------------------- 優位性が偶然と区別できるか
+    out_lo, out_hi = out_s.expectancy_ci()
+    if out_lo <= 0:
+        failures.append(
+            f"アウトオブサンプルの期待値 {out_s.expectancy_r:+.2f} R は、"
+            f"95% 信頼区間が [{out_lo:+.2f}, {out_hi:+.2f}] R でゼロをまたぎます"
+            "（優位性が偶然と区別できません）"
+        )
+
+    # ------------------------------------------------------ 買い持ちとの比較
     bench_r, bench_dd = out_s.benchmark_return, out_s.benchmark_max_drawdown
-    if len(out_s.benchmark_curve) >= 2:
-        if out_s.total_return < bench_r and out_s.max_drawdown >= bench_dd:
+    if len(out_s.benchmark_curve) >= 2 and out_s.total_return < bench_r:
+        # ドローダウン 1% あたり何 % 取れたか。投資額も損切りの有無も違う
+        # 両者を、同じ土俵で並べるためのいちばん素朴な物差し。
+        ratio = out_s.total_return / out_s.max_drawdown if out_s.max_drawdown > 0 else 0.0
+        bench_ratio = bench_r / bench_dd if bench_dd > 0 else 0.0
+        detail = (
+            f"同じ期間の買い持ち {bench_r:+.1%}（最大DD {bench_dd:.1%}）に対し、"
+            f"戦略は {out_s.total_return:+.1%}（最大DD {out_s.max_drawdown:.1%}）。"
+            f" リスク調整後（リターン÷最大DD）は 戦略 {ratio:.2f} / 買い持ち {bench_ratio:.2f}"
+        )
+        if ratio < bench_ratio:
             failures.append(
-                f"同じ期間の買い持ち（{bench_r:+.1%} / 最大DD {bench_dd:.1%}）に、"
-                f"リターンでもドローダウンでも負けています"
-                f"（{out_s.total_return:+.1%} / 最大DD {out_s.max_drawdown:.1%}）"
+                detail + " ＝ リスクを抑えたぶんを差し引いても買い持ちに負けています。"
+                " 毎日売買する意味がありません"
             )
-        elif out_s.total_return < bench_r:
-            # ドローダウン 1% あたり何 % 取れたか。投資額も損切りの有無も違う
-            # 両者を、同じ土俵で並べるためのいちばん素朴な物差し。
-            ratio = out_s.total_return / out_s.max_drawdown if out_s.max_drawdown > 0 else 0.0
-            bench_ratio = bench_r / bench_dd if bench_dd > 0 else 0.0
+        else:
             lines.append(
-                f"⚠️  リターンでは買い持ち（{bench_r:+.1%}）に負けています"
-                f"（戦略 {out_s.total_return:+.1%}）。"
-                f"\n    最大DDは戦略 {out_s.max_drawdown:.1%} / 買い持ち {bench_dd:.1%}。"
-                f"\n    リスク調整後（リターン ÷ 最大DD）: 戦略 {ratio:.2f} / 買い持ち {bench_ratio:.2f}"
-                + (
-                    "\n    → リスクを抑えたぶんを差し引いても、買い持ちに負けています。"
-                    if ratio < bench_ratio
-                    else "\n    → リスクあたりでは買い持ちを上回っています。"
-                )
+                f"⚠️  リターンでは買い持ちに負けています。{detail}"
+                "\n    → リスクあたりでは上回っています。取れる金額は小さいが、"
+                "揺れも小さいという性質です。"
             )
 
-    # 上位数銘柄の当たりで成り立っていないか
+    # ------------------------------------------ 数銘柄の当たりで出来ていないか
     top3 = out_s.top3_profit_share
     if top3 > 0.7:
         failures.append(
@@ -855,27 +915,9 @@ def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
     if failures:
         lines.append("❌ この戦略は実運用に載せないでください。")
         lines.extend(f"   ・{reason}" for reason in failures)
-        if in_s.net_pnl_jpy > 0:
-            lines.append("   ・前半では勝てていたので、過剰最適化の可能性があります。")
+        if in_s.period_pnl_jpy > 0:
+            lines.append("   ・前半では増えていたので、過剰最適化の可能性があります。")
         return FAIL, lines
-
-    # ------------------------------------------------ 過剰最適化の検査可否
-    #
-    # ⚠️ 発動条件は「取引数」ではなく **期間の構造** で決める。
-    # 取引数は回してみないと分からない出力なので、それを条件にすると
-    # 「たまたま取引が少なかった」あらゆる戦略が検査を回避できてしまう。
-    # 前半の売買可能期間が最大保有日数の 2 倍を切ると、独立した売買が
-    # 1 巡もせず、期末の打ち切りが全取引に効く。これは実行前に分かる。
-    needed = report.max_holding_days * 2
-    blockers: list[str] = []
-    if report.in_window_days < needed:
-        blockers.append(
-            f"前半の売買可能期間が {report.in_window_days} 営業日しかなく、"
-            f" 最大保有 {report.max_holding_days} 日の売買が 1 巡もしません"
-            f"（{needed} 営業日以上必要）"
-        )
-    if len(in_s.trades) < 30:
-        blockers.append(f"前半の取引が {len(in_s.trades)} 件しかなく、期待値を推定できません")
 
     if blockers:
         lines.append("⚠️  判定保留。この戦略は「合格した」のではなく「検証できなかった」状態です。")
@@ -886,7 +928,28 @@ def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
         lines.append("     履歴を伸ばすか、少額のフォワードテストで取引数を稼いでください。")
         return UNDETERMINED, lines
 
-    if in_s.expectancy_r > 0 and out_s.expectancy_r < in_s.expectancy_r * 0.5:
+    # ------------------------------------------------ 前半に優位性があったか
+    #
+    # ⚠️ ここが無いと過剰最適化の検査が空回りする。
+    # 「後半が前半の半分未満か」は、前半に優位性があって初めて意味を持つ。
+    # 前半の期待値が実質ゼロだと、後半がどんな値でも「劣化していない」と
+    # 判定されて素通りする（実測で発生: 前半 +0.00R・PF 1.01 なのに合格）。
+    # 前半にも後半にも優位性が要る。片方だけなら、それは相場か偶然の産物。
+    in_lo, in_hi = in_s.expectancy_ci()
+    if in_lo <= 0:
+        lines.append("❌ この戦略は実運用に載せないでください。")
+        lines.append(
+            f"   ・前半に優位性がありません"
+            f"（期待値 {in_s.expectancy_r:+.2f} R / 95%信頼区間 [{in_lo:+.2f}, {in_hi:+.2f}] R）"
+        )
+        lines.append(
+            f"   ・前半 {len(in_s.trades)} 件・{report.in_window_days} 営業日を使って"
+            " ゼロと区別できないということは、"
+        )
+        lines.append("     後半だけ良かったのは相場のおかげか偶然と考えるのが自然です。")
+        return FAIL, lines
+
+    if out_s.expectancy_r < in_s.expectancy_r * 0.5:
         lines.append("❌ 後半で期待値が半分以下に落ちています。過剰最適化の疑いが濃厚です。")
         lines.append(f"   ・前半 {in_s.expectancy_r:+.2f} R → 後半 {out_s.expectancy_r:+.2f} R")
         return FAIL, lines
@@ -902,7 +965,9 @@ def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
             " 戦略が決めた決済ではありません。成績は途中経過に近いものです。"
         )
 
-    lines.append("✅ 前半・後半とも資産が増え、期待値も保たれています。")
+    lines.append("✅ 前半・後半とも優位性が確認でき、買い持ちにも負けていません。")
+    lines.append(f"   前半の期待値 95%区間 [{in_lo:+.2f}, {in_hi:+.2f}] R /"
+                 f" 後半 [{out_lo:+.2f}, {out_hi:+.2f}] R")
     lines.append("   ただしこれは必要条件であって十分条件ではありません。")
     lines.append("   生存者バイアス（上場廃止銘柄を含まない）のぶん、実際はこれより悪くなります。")
     return PASS, lines

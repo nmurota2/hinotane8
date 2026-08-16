@@ -184,12 +184,17 @@ def _result(
     bench: float = 0.0,
     bench_dd: float = 0.5,
     max_dd: float = 0.1,
+    ci: tuple[float, float] | None = None,
 ):
     """判定に必要な指標だけを持つスタブ。"""
     from types import SimpleNamespace
 
+    # 期待値の信頼区間は、点推定のまわりに幅を持たせて模す。
+    # ci=None なら「点推定の ±50%」＝ 符号が変わらない区間になる。
+    lo, hi = ci if ci else (expectancy * 0.5, expectancy * 1.5)
     return SimpleNamespace(
         trades=list(range(n_trades)),
+        expectancy_ci=lambda **_kw: (lo, hi),
         net_pnl_jpy=net_pnl,
         period_pnl_jpy=net_pnl,
         carried_in_trades=0,
@@ -583,3 +588,88 @@ def test_carried_over_profit_is_disclosed_even_when_positive():
     text = "\n".join(lines)
     assert "持ち越し" in text, f"持ち越しの含み益を明示していない: {lines}"
     assert "+1,215 円" in text
+
+
+# ------------------------------------------- 「✅ なのに買い持ちに負けている」
+
+
+def test_losing_to_buy_and_hold_risk_adjusted_is_rejected():
+    """リスク調整後でも買い持ちに負けるなら、合格にしないこと。
+
+    実測で自己矛盾が出た。同じ出力の中で
+        → リスクを抑えたぶんを差し引いても、買い持ちに負けています。
+        ✅ 前半・後半とも資産が増え、期待値も保たれています。
+    が 2 行違いで並んだ。この判定は「実弾を入れるか」を決めるためのもので、
+    同じ銘柄を買って放っておくほうが良いなら毎日売買する意味がない。
+    """
+    from hinotane.backtest import FAIL, judge
+
+    verdict, lines = judge(
+        _report(
+            _result(net_pnl=21_026, expectancy=0.004, pf=1.01, n_trades=167),
+            _result(
+                net_pnl=97_453, expectancy=0.14, pf=1.41, n_trades=89,
+                bench=0.625, bench_dd=0.187, max_dd=0.089,
+            ),
+            in_window=602,
+        )
+    )
+    assert verdict == FAIL, f"買い持ちに負けているのに合格になった: {lines}"
+    text = "\n".join(lines)
+    assert "✅" not in text, "❌ と ✅ を同時に出してはいけない"
+    assert "リスク調整後" in text
+
+
+def test_no_edge_in_the_first_half_is_rejected():
+    """前半に優位性が無いものを合格にしないこと。
+
+    「後半が前半の半分未満か」という過剰最適化の検査は、前半に優位性が
+    あって初めて意味を持つ。前半の期待値が実質ゼロだと、後半がどんな値でも
+    「劣化していない」と判定されて素通りする。
+    実測: 前半 167 取引・期待値 +0.00R・PF 1.01 なのに合格が出た。
+    """
+    from hinotane.backtest import FAIL, judge
+
+    verdict, lines = judge(
+        _report(
+            # 前半は 167 取引もあるのに、区間がゼロをまたぐ＝優位性なし
+            _result(
+                net_pnl=21_026, expectancy=0.004, pf=1.01, n_trades=167,
+                ci=(-0.06, 0.07),
+            ),
+            _result(net_pnl=97_453, expectancy=0.14, pf=1.41, n_trades=89, bench=0.0),
+            in_window=602,
+        )
+    )
+    assert verdict == FAIL, f"前半に優位性が無いのに合格になった: {lines}"
+    assert any("前半に優位性がありません" in line for line in lines)
+
+
+def test_expectancy_whose_interval_straddles_zero_is_rejected():
+    """期待値の信頼区間がゼロをまたぐなら、偶然と区別できていない。"""
+    from hinotane.backtest import FAIL, judge
+
+    verdict, lines = judge(
+        _report(
+            _result(net_pnl=100_000, expectancy=0.3, pf=1.5, n_trades=60),
+            _result(
+                net_pnl=50_000, expectancy=0.10, pf=1.2, n_trades=60,
+                ci=(-0.05, 0.26),
+            ),
+            in_window=400,
+        )
+    )
+    assert verdict == FAIL
+    assert any("偶然と区別できません" in line for line in lines)
+
+
+def test_bootstrap_interval_is_deterministic_and_brackets_the_estimate(noise_cfg, db):
+    """信頼区間が毎回同じ値で、点推定を挟むこと。"""
+    _driftless_market(db)
+    r = run_backtest(noise_cfg, db, label="信頼区間", max_symbols=60)
+    assert len(r.trades) >= 10
+
+    lo, hi = r.expectancy_ci()
+    assert (lo, hi) == r.expectancy_ci(), "呼ぶたびに違う値では判定に使えない"
+    assert lo <= r.expectancy_r <= hi, f"点推定 {r.expectancy_r} が区間 [{lo}, {hi}] の外"
+    assert lo < hi
