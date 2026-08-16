@@ -12,6 +12,7 @@
     hinotane mark                     建玉の損切り・利確・時間切れを判定
     hinotane backtest                 バックテスト
     hinotane walkforward              イン／アウトオブサンプル検証
+    hinotane diagnose                 負けている原因を特定
     hinotane serve                    LINE Webhook サーバーを起動
     hinotane doctor                   設定の健康診断
 """
@@ -302,6 +303,15 @@ def cmd_walkforward(args, cfg, db) -> int:
     return 0
 
 
+def cmd_diagnose(args, cfg, db) -> int:
+    """負けている戦略の、どこが悪いのかを特定する。"""
+    from .diagnose import diagnose
+
+    strategies = args.strategies.split(",") if args.strategies else None
+    print(diagnose(cfg, db, strategy_names=strategies, max_symbols=args.max_symbols))
+    return 0
+
+
 def cmd_serve(args, cfg, db) -> int:
     import uvicorn
 
@@ -353,6 +363,11 @@ def build_parser() -> argparse.ArgumentParser:
     wf.add_argument("--split", type=float, default=0.6, help="前半（イン・サンプル）の割合")
     wf.add_argument("--max-symbols", type=int, default=600)
     wf.set_defaults(func=cmd_walkforward)
+
+    dg = sub.add_parser("diagnose", help="戦略のどこが悪いのかを診断")
+    dg.add_argument("--strategies", help="カンマ区切り。省略時は設定値")
+    dg.add_argument("--max-symbols", type=int, default=600)
+    dg.set_defaults(func=cmd_diagnose)
 
     sub.add_parser("serve", help="LINE Webhook サーバーを起動").set_defaults(func=cmd_serve)
     return p
