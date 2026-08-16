@@ -56,6 +56,10 @@ class Trade:
     risk_jpy: float            # この取引で失う想定だった金額（損切り幅 × 数量）
     r_multiple: float          # 損切り幅の何倍取れたか
     exit_reason: str
+    #: 保有中に到達した最大の含み益・含み損（R 倍）。
+    #: 「トレーリングがピークからいくら返上したか」を測るために要る。
+    mfe_r: float = 0.0
+    mae_r: float = 0.0
 
 
 @dataclass
@@ -381,6 +385,7 @@ def _build_signal_table(
                         "max_holding_days": strategy.max_holding_days,
                         "trailing_atr_mult": strategy.trailing_atr_mult,
                         "use_stop_exit": strategy.use_stop_exit,
+                        "exit_trigger": strategy.exit_trigger,
                     }
                 )
             )
@@ -443,6 +448,10 @@ def _close_position(
         risk_jpy=risk,
         r_multiple=pnl / risk if risk > 0 else 0.0,
         exit_reason=exit_reason,
+        mfe_r=(pos.get("best", pos["entry_price"]) - pos["entry_price"])
+        * pos["quantity"] / risk if risk > 0 else 0.0,
+        mae_r=(pos.get("worst", pos["entry_price"]) - pos["entry_price"])
+        * pos["quantity"] / risk if risk > 0 else 0.0,
     )
 
 
@@ -640,7 +649,10 @@ def run_backtest(
                             "max_holding_days": int(sig["max_holding_days"]),
                             "trailing_atr_mult": None if pd.isna(trail) else trail,
                             "use_stop_exit": bool(sig.get("use_stop_exit", True)),
+                            "exit_trigger": str(sig.get("exit_trigger", "low")),
                             "highest": entry_price,
+                            "best": entry_price,    # 保有中の最高値（MFE 用）
+                            "worst": entry_price,   # 保有中の最安値（MAE 用）
                             # 「翌営業日の寄りで売る」と決まった決済理由。
                             # 本番は引け後に判定して翌朝に成行を出すので、
                             # 判定した瞬間には決済できない。
@@ -666,9 +678,14 @@ def run_backtest(
             bar = prices[pos["code"]].loc[today]
 
             held = i - date_index[pos["entry_date"]]
-            if pos["use_stop_exit"] and bar["low"] <= pos["stop"]:
+            pos["best"] = max(pos["best"], float(bar["high"]))
+            pos["worst"] = min(pos["worst"], float(bar["low"]))
+            # 決済トリガー。日中安値だとヒゲで落ちる、終値だと実効幅が広がる。
+            trigger_low = float(bar["close"] if pos["exit_trigger"] == "close" else bar["low"])
+            trigger_high = float(bar["close"] if pos["exit_trigger"] == "close" else bar["high"])
+            if pos["use_stop_exit"] and trigger_low <= pos["stop"]:
                 pos["pending_exit"] = "stop"
-            elif bar["high"] >= pos["target"]:
+            elif trigger_high >= pos["target"]:
                 pos["pending_exit"] = "target"
             elif held >= pos["max_holding_days"]:
                 pos["pending_exit"] = "timeout"

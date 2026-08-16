@@ -13,11 +13,17 @@ from .base import Strategy, StrategySignal, available, get_strategy, register
 from .breakout import BreakoutStrategy
 from .pullback import PullbackStrategy
 from .research import (
+    TrendCloseTrigger,
     TrendFixedStopStrategy,
     TrendLooseEntryStrategy,
     TrendNoStopStrategy,
     TrendRandomPickStrategy,
     TrendRegimeFilterStrategy,
+    TrendTrail5,
+    TrendTrail7,
+    TrendTrail7Close,
+    TrendTrail7RandomPick,
+    TrendTrail10,
 )
 from .reversal import ReversalStrategy
 from .trend import TrendStrategy
@@ -28,12 +34,18 @@ __all__ = [
     "ReversalStrategy",
     "Strategy",
     "StrategySignal",
+    "TrendCloseTrigger",
     "TrendFixedStopStrategy",
     "TrendLooseEntryStrategy",
     "TrendNoStopStrategy",
     "TrendRandomPickStrategy",
     "TrendRegimeFilterStrategy",
     "TrendStrategy",
+    "TrendTrail5",
+    "TrendTrail7",
+    "TrendTrail7Close",
+    "TrendTrail7RandomPick",
+    "TrendTrail10",
     "available",
     "get_strategy",
     "register",

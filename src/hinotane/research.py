@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 
+import numpy as np
 import pandas as pd
 
 from .backtest import BacktestResult, _build_signal_table, run_backtest
@@ -40,13 +41,14 @@ class Experiment:
     name: str
     hypothesis: str          # 何を確かめる実験か
     strategy: str
-    risk: dict = field(default_factory=dict)   # RiskConfig の上書き
+    risk: dict = field(default_factory=dict)        # RiskConfig の上書き
+    execution: dict = field(default_factory=dict)   # ExecutionConfig の上書き
 
 
 #: 実験の一覧。**思いついた順に足さないこと。**
 #: ここに 1 行足すたびに検定回数が増え、全体の基準が上がる。
 #: 足すなら「この結果が出たら何が結論できるか」を hypothesis に書けるものだけ。
-BATTERY: list[Experiment] = [
+ROUND1: list[Experiment] = [
     Experiment(
         name="① 本家 trend",
         hypothesis="比較の基準。ここからの差で各要素の寄与を測る",
@@ -93,6 +95,67 @@ BATTERY: list[Experiment] = [
         risk={"max_open_positions": 30, "max_signals_per_day": 15, "max_position_pct": 1 / 30},
     ),
 ]
+
+
+#: 第 2 ラウンド。第 1 ラウンドで分かったことを受けて設計してある。
+#:
+#: 第 1 ラウンドの結論:
+#:   * 順位づけは何もしていない（乱数と差が出ない／情報係数も実質ゼロ）
+#:   * トレーリングを外すと +0.48R 改善する
+#:
+#: そのあと実測値を分解して分かったこと:
+#:   5年の成績 +11.4% = 保有中の相場上昇 +51.9pp − ずれ 14.9pp − 売買コスト 25.6pp
+#:   **売買コストが純利益の 2.25 倍**。そしてコストを決めているのは回転数、
+#:   回転数を決めているのはトレーリング幅（横切るまでの時間は幅の 2 乗に比例）。
+#:
+#: つまり第 2 ラウンドで確かめるのは「回転数を落とせば成績は戻るか」の一点。
+ROUND2: list[Experiment] = [
+    Experiment(
+        name="① 本家 trend",
+        hypothesis="比較の基準（トレーリング3×ATR・日中安値で判定）",
+        strategy="trend",
+    ),
+    Experiment(
+        name="② トレーリング5×ATR",
+        hypothesis="幅の2乗で回転数が落ちるなら、取引数は約半分になるはず",
+        strategy="研究:トレーリング5",
+    ),
+    Experiment(
+        name="③ トレーリング7×ATR",
+        hypothesis="取引数が約1/5に落ち、売買コストが25.6pp→4.7ppになるはず",
+        strategy="研究:トレーリング7",
+    ),
+    Experiment(
+        name="④ トレーリング10×ATR",
+        hypothesis="広げすぎると今度は下落を取り返せなくなる。どこかで頭打ちになるはず",
+        strategy="研究:トレーリング10",
+    ),
+    Experiment(
+        name="⑤ 終値で判定",
+        hypothesis="ヒゲでの決済が消え、実効的な損切り幅が広がって回転数が落ちるはず",
+        strategy="研究:終値で判定",
+    ),
+    Experiment(
+        name="⑥ トレーリング7＋終値",
+        hypothesis="②〜⑤が効くなら、両方入れたこれが最も良くなるはず",
+        strategy="研究:トレーリング7＋終値",
+    ),
+    Experiment(
+        name="⑦ 本家＋現実的な売買コスト",
+        hypothesis="スリッページ0.2%は建玉20万円には過大。0.03%なら成績がどれだけ変わるか",
+        strategy="trend",
+        execution={"slippage_pct": 0.0003},
+    ),
+    Experiment(
+        name="⑧ トレーリング7＋順位乱数",
+        hypothesis="回転数を落としても順位づけが効かないままなら、選別は諦めるべき",
+        strategy="研究:トレーリング7＋順位乱数",
+    ),
+]
+
+#: 実行するラウンド。過去のラウンドも検定回数に数える（多重検定の代償）。
+BATTERIES: dict[str, list[Experiment]] = {"1": ROUND1, "2": ROUND2}
+BATTERY = ROUND2
 
 
 @dataclass
@@ -181,6 +244,7 @@ def run_research(
     *,
     max_symbols: int = 600,
     split: float = 0.6,
+    battery: str = "2",
 ) -> str:
     """実験を一括で走らせ、判断できる形の報告を返す。
 
@@ -189,7 +253,8 @@ def run_research(
     かかる時間はほとんど変わらない。
     """
     out: list[str] = []
-    strategy_names = sorted({e.strategy for e in BATTERY})
+    experiments = BATTERIES.get(battery, ROUND2)
+    strategy_names = sorted({e.strategy for e in experiments})
 
     # --- 実験に使う期間を決める（後半は封印する） ------------------------
     prebuilt = _build_signal_table(cfg, db, strategy_names, max_symbols)
@@ -208,10 +273,13 @@ def run_research(
         )
     boundary = tradable[min(max(int(len(tradable) * split), 1), len(tradable) - 1)]
 
-    k = len(BATTERY)
+    k = len(experiments)
+    # 同じデータで何回検定したかは、ラウンドをまたいで積み上がる。
+    # 「今回は 8 個だけ」と数えると、多重検定の代償を過小に見積もる。
+    cumulative = sum(len(BATTERIES[b]) for b in BATTERIES if b <= battery)
     # ボンフェローニ補正。K 回検定するなら、1 回あたりの有意水準を K で割る。
     # そうしないと「優位性が無くても K×5% は当たって見える」を防げない。
-    confidence = 1.0 - 0.05 / k
+    confidence = 1.0 - 0.05 / cumulative
 
     out.append("=" * 78)
     out.append("実験の設計")
@@ -223,17 +291,20 @@ def run_research(
     out.append("     ここで見つけたものを、最後に 1 回だけ後半で検証します。")
     out.append("     何度も覗いたデータは、もうアウト・オブ・サンプルではありません。")
     out.append("")
-    out.append(f"  実験数   : {k} 個")
-    out.append(f"  信頼区間 : {confidence:.1%}（ボンフェローニ補正済み。通常の95%ではありません）")
-    out.append(f"     → {k} 個も試せば、優位性が無くても {k * 0.05:.1f} 個は")
+    out.append(f"  実験数   : {k} 個（第 {battery} ラウンド）")
+    out.append(f"  累計検定 : {cumulative} 回（過去のラウンドを含む）")
+    out.append(f"  信頼区間 : {confidence:.2%}（ボンフェローニ補正済み。通常の95%ではありません）")
+    out.append(f"     → 累計 {cumulative} 個も試せば、優位性が無くても {cumulative * 0.05:.1f} 個は")
     out.append("       95%区間で「当たり」に見えます。そのぶん基準を上げてあります。")
 
     # --- 実験を走らせる --------------------------------------------------
     results: list[ExperimentResult] = []
-    for exp in BATTERY:
+    for exp in experiments:
         exp_cfg = cfg
         if exp.risk:
-            exp_cfg = replace(cfg, risk=replace(cfg.risk, **exp.risk))
+            exp_cfg = replace(exp_cfg, risk=replace(exp_cfg.risk, **exp.risk))
+        if exp.execution:
+            exp_cfg = replace(exp_cfg, execution=replace(exp_cfg.execution, **exp.execution))
         r = run_backtest(
             exp_cfg,
             db,
@@ -255,7 +326,7 @@ def run_research(
     out.append("=" * 78)
     out.append(
         f"  {'実験':<22} {'取引':>5} {'リターン':>8} {'最大DD':>7}"
-        f" {'PF':>6} {'期待値[' + f'{confidence:.0%}' + '区間]':>7}"
+        f" {'PF':>6}   期待値[補正後の信頼区間]"
     )
     out.append("  " + "-" * 74)
     for er in results:
@@ -339,6 +410,25 @@ def run_research(
             out.append("  → ⚠️ 乱数のほうが良い。順位づけが **逆に働いています**。")
         out.append("     ※ 乱数の対照群は 1 通りしか試していません。乱数の引き次第で")
         out.append("       この差はぶれます。小さな差を意味づけしないでください。")
+
+    if battery == "2":
+        out.append("")
+        out.append("【回転数と売買コスト】")
+        out.append("  1取引あたりの往復コスト = (スリッページ + 手数料) × 2 × 建玉")
+        for er in results:
+            n = len(er.result.trades)
+            if not n:
+                continue
+            hold = [(t.exit_date - t.entry_date).days for t in er.result.trades]
+            mfe = [t.mfe_r for t in er.result.trades]
+            out.append(
+                f"  {er.experiment.name:<22} 取引 {n:>4} 件 /"
+                f" 平均保有 {np.mean(hold):>5.1f} 日 /"
+                f" ピーク含み益 平均 {np.mean(mfe):>+5.2f}R /"
+                f" 実現 {er.result.expectancy_r:>+5.2f}R"
+            )
+        out.append("  → ピーク含み益と実現の差が、トレーリングが返上した分です。")
+        out.append("     幅を広げると保有日数が伸び、取引数が減り、コストが下がるはずです。")
 
     out.append("")
     out.append("【2】損切りは得か損か")

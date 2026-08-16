@@ -44,7 +44,8 @@ from .strategies.base import get_strategy
 #: 試す指標。**「上から選ぶ」向きに符号を揃えてある**（大きいほど良い候補）。
 #: 増やすたびに多重検定の代償が増えるので、機構の説明がつくものだけ入れる。
 FACTORS: dict[str, Callable[[pd.DataFrame], pd.Series]] = {
-    "12-1モメンタム（いま使用中）": lambda d: d["mom120"],
+    "7-1モメンタム（いま使用中）": lambda d: d["mom120"],
+    "12-1モメンタム（文献の定義）": lambda d: d["mom250"],
     "3か月モメンタム": lambda d: d["mom60"],
     "1か月モメンタム": lambda d: d["mom20"],
     "低ボラティリティ": lambda d: -d["atr_pct"],

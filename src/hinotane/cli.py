@@ -369,7 +369,8 @@ def cmd_research(args, cfg, db) -> int:
     """対照群と比べて、どの要素が効いていないのかを実験で特定する。"""
     from .research import run_research
 
-    print(run_research(cfg, db, max_symbols=args.max_symbols, split=args.split))
+    print(run_research(cfg, db, max_symbols=args.max_symbols, split=args.split,
+                       battery=args.round))
     return 0
 
 
@@ -450,6 +451,8 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--max-symbols", type=int, default=600)
     rs.add_argument("--split", type=float, default=0.6,
                     help="前半（実験に使う範囲）の割合。後半は封印される")
+    rs.add_argument("--round", default="2", choices=["1", "2"],
+                    help="実験ラウンド。1=敗因の切り分け / 2=回転数の検証")
     rs.set_defaults(func=cmd_research)
 
     fa = sub.add_parser("factors", help="候補の順位づけに情報があるかを測る")

@@ -163,3 +163,105 @@ class TrendLooseEntryStrategy(TrendStrategy):
         out["stop_price"] = np.where(entry, stop, np.nan)
         out["target_price"] = np.where(entry, close + 10.0 * (close - stop), np.nan)
         return out
+
+
+# --------------------------------------------------------- 回転数を落とす実験
+#
+# 分析で判明したこと（実測値からの分解）:
+#
+#   5年の成績 +11.4% は、次の 3 つの合計にほぼ完全に分解できる。
+#     保有中の相場の上昇   +51.9pp
+#     エントリー/決済のずれ −14.9pp
+#     売買コスト           −25.6pp   ← 純利益 +11.4% の 2.25 倍
+#
+#   売買コストは「1 回あたり 0.5%（往復）× 建玉 20 万円 × 256 回」。
+#   つまり **回転数がそのまま成績を食っている**。
+#
+#   そして回転数を決めているのはトレーリング幅。値動きが幅 d のバンドを
+#   横切るまでの時間は d² に比例するので、幅を 3→7 に広げると
+#   取引数は 256 → 約 47 件、コストは 25.6pp → 4.7pp に落ちる。
+#
+#   ⚠️ 重要: 幅を広げるとき、**数量計算に使う損切り（3×ATR）は動かさない**。
+#   動かすと建玉が半分になり、相場の上昇から得ていた +51.9pp も半減する。
+#   このコードでは atr_stop_mult（初期の損切り＝数量の基準）と
+#   trailing_atr_mult（切り上げの幅）が別の設定なので、分離できている。
+
+
+class _TrailingSweep(TrendStrategy):
+    """トレーリング幅だけを変えた対照群の共通部分。"""
+
+    atr_stop_mult = 3.0        # 数量計算と初期リスクは触らない
+
+
+@register
+class TrendTrail5(_TrailingSweep):
+    name = "研究:トレーリング5"
+    label = "trend のトレーリングを5×ATRに広げた"
+    trailing_atr_mult = 5.0
+
+
+@register
+class TrendTrail7(_TrailingSweep):
+    name = "研究:トレーリング7"
+    label = "trend のトレーリングを7×ATRに広げた"
+    trailing_atr_mult = 7.0
+
+
+@register
+class TrendTrail10(_TrailingSweep):
+    name = "研究:トレーリング10"
+    label = "trend のトレーリングを10×ATRに広げた"
+    trailing_atr_mult = 10.0
+
+
+@register
+class TrendCloseTrigger(TrendStrategy):
+    """決済判定を終値で行う対照群。
+
+    いまは日中安値が損切り価格に触れた時点で決済が確定する。しかし本番は
+    引け後に判定して翌朝の寄りで売るので、**逆指値と同じ頻度で発動するのに、
+    逆指値の価格はもらえない**という一方的に不利な組み合わせになっている。
+
+    終値で判定すればヒゲでの発動が消え、実効的な損切り幅が広がる。
+    回転数が落ちるぶん売買コストも減る。
+    """
+
+    name = "研究:終値で判定"
+    label = "trend の決済判定を終値にした（ヒゲで切られない）"
+    exit_trigger = "close"
+
+
+@register
+class TrendTrail7Close(_TrailingSweep):
+    """回転数を落とす 2 つの変更を両方入れたもの。
+
+    分析の予測どおりなら、これが最も成績が良くなるはず。
+    ただし **2 つ同時に変えているので、どちらが効いたかは単独では分からない**。
+    上の単独版と並べて初めて切り分けられる。
+    """
+
+    name = "研究:トレーリング7＋終値"
+    label = "トレーリング7×ATR かつ 終値で判定"
+    trailing_atr_mult = 7.0
+    exit_trigger = "close"
+
+
+@register
+class TrendTrail7RandomPick(_TrailingSweep):
+    """回転数を落としたうえで、順位づけだけ乱数にした対照群。
+
+    第 1 ラウンドでは「回転数が高すぎて売買コストに埋もれている」状態で
+    順位づけを比べていた。コストで消える金額（純利益の 2.25 倍）のほうが
+    大きければ、順位づけの差はそもそも見えない。
+    回転数を落としてから、あらためて同じ比較をする。
+    """
+
+    name = "研究:トレーリング7＋順位乱数"
+    label = "トレーリング7×ATR・選ぶ順は乱数（対照群）"
+    trailing_atr_mult = 7.0
+
+    def evaluate(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = super().evaluate(df)
+        code = out["code"] if "code" in out.columns else pd.Series("?", index=out.index)
+        out["score"] = _stable_random(code, out["date"])
+        return out

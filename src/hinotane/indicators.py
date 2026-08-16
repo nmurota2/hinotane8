@@ -84,9 +84,15 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     # 直近 60 営業日の騰落率（モメンタム）
     out["mom60"] = close / close.shift(60) - 1.0
     out["mom20"] = close / close.shift(20) - 1.0
-    # 相対的な強さの尺度。半年ぶんの上昇率で、直近1か月は除く。
-    # 直近は反落しやすいので外すのが定石（12-1 モメンタム）。
-    out["mom120"] = close.shift(20) / close.shift(140) - 1.0
+    # 相対的な強さの尺度。直近 1 か月を除いた騰落率。
+    # 直近は短期反転が効きやすいので外すのが定石。
+    #
+    # ⚠️ 名前と中身に注意。以前ここを「12-1 モメンタム」と書いていたが、
+    # 140 営業日は約 6.7 か月なので実際は **7-1 モメンタム**だった。
+    # 文献で機能が確認されているのは 12-1（約 252 営業日）のほうなので、
+    # 両方を持って比較できるようにしてある。
+    out["mom120"] = close.shift(20) / close.shift(140) - 1.0   # 7-1
+    out["mom250"] = close.shift(21) / close.shift(252) - 1.0   # 12-1（文献の定義）
     out["high120"] = rolling_max(high, 120)
     out["high50"] = rolling_max(high, 50)
 

@@ -709,14 +709,22 @@ def test_research_never_touches_the_holdout(noise_cfg, db, monkeypatch):
 
 def test_research_reports_how_many_times_it_tested(noise_cfg, db):
     """検定回数と、そのぶん広げた信頼区間を必ず表示すること。"""
-    from hinotane.research import BATTERY, run_research
+    from hinotane.research import BATTERIES, run_research
 
     _driftless_market(db, n_days=520)
-    text = run_research(noise_cfg, db, max_symbols=30)
+    text = run_research(noise_cfg, db, max_symbols=30, battery="1")
 
-    assert f"実験数   : {len(BATTERY)} 個" in text
+    assert f"実験数   : {len(BATTERIES['1'])} 個" in text
     assert "ボンフェローニ" in text
     assert "② 選ぶ順を乱数に" in text, "対照群が結果表に出ていない"
+
+    # ラウンドをまたいで検定回数が積み上がること。
+    # 「今回は 8 個だけ」と数えると、多重検定の代償を過小に見積もる。
+    text2 = run_research(noise_cfg, db, max_symbols=30, battery="2")
+    total = len(BATTERIES["1"]) + len(BATTERIES["2"])
+    assert f"累計検定 : {total} 回" in text2, (
+        "過去のラウンドの検定回数が累計されていない"
+    )
 
 
 def test_random_pick_control_differs_only_in_ranking(noise_cfg, db):
