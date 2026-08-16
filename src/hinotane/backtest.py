@@ -109,7 +109,31 @@ class BacktestResult:
 
     @property
     def net_pnl_jpy(self) -> float:
+        """この期間に **決済した** 取引の損益合計。
+
+        ⚠️ 期間を切り出した結果ではこれを「その期間に稼いだ額」と読んではいけない。
+        期間をまたいだ建玉の利益は、前の期間で積み上がった含み益であっても
+        決済した期間に全額が計上される。実際に口座が増えた額は period_pnl_jpy。
+        """
         return sum(t.pnl_jpy for t in self.trades)
+
+    @property
+    def period_pnl_jpy(self) -> float:
+        """この期間に **実際に口座が増減した** 額（含み損益の変化を含む）。
+
+        期間をまたいだ建玉があると net_pnl_jpy とずれる。ずれたときは
+        こちらが本物。合否はこの額で判断する。
+        """
+        return self.final_equity - self.initial_equity
+
+    @property
+    def carried_in_trades(self) -> int:
+        """この期間より前に建てられた建玉の件数。
+
+        多いほど、この期間の勝率・期待値・プロフィットファクターは
+        「前の期間で積み上がった含み益」を自分の手柄として数えている。
+        """
+        return sum(1 for t in self.trades if t.entry_date < self.start)
 
     @property
     def avg_risk_jpy(self) -> float:
@@ -168,11 +192,21 @@ class BacktestResult:
             f"  最大DD        : {self.max_drawdown:.1%}",
             f"  プロフィットF : {self.profit_factor:.2f}",
             f"  期待値        : {self.expectancy_r:+.2f} R（リスク額で加重）",
-            f"  確定損益      : {self.net_pnl_jpy:+,.0f} 円（この期間に決済した分）",
+            f"  期間の損益    : {self.period_pnl_jpy:+,.0f} 円 ← この期間に実際に増えた額",
             f"  1取引の平均リスク: {self.avg_risk_jpy:,.0f} 円",
             f"  上位3取引の利益寄与: {self.top3_profit_share:.0%}",
             f"  最終資産      : {self.final_equity:,.0f} 円",
         ]
+        carried = self.carried_in_trades
+        if carried:
+            lines.insert(
+                -1,
+                f"  決済した取引の損益合計: {self.net_pnl_jpy:+,.0f} 円\n"
+                f"    ※ うち {carried} 件はこの期間より前に建てた建玉です。"
+                " 前の期間で積み上がった\n"
+                "       含み益もここに全額計上されるので、"
+                "「この期間に稼いだ額」ではありません。",
+            )
         if len(self.benchmark_curve) >= 2:
             lines.append(
                 f"  同期間の買い持ち: {self.benchmark_return:+.1%}"
@@ -753,10 +787,22 @@ def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
 
     # ---------------------------------------------------------- お金の検査
     failures: list[str] = []
-    if out_s.net_pnl_jpy <= 0:
+    # ⚠️ 判定に使うのは period_pnl_jpy（口座が実際に増減した額）。
+    # net_pnl_jpy（決済した取引の合計）を使うと、前半で積み上がった含み益を
+    # 後半に決済しただけで「後半も稼いだ」ことになってしまう。
+    # 実際に起きた: 後半の決済損益 +72,852 円に対し、口座の増加は +1,215 円。
+    if out_s.period_pnl_jpy <= 0:
         failures.append(
             f"アウトオブサンプルで資産が減っています"
-            f"（{out_s.net_pnl_jpy:+,.0f} 円 / {out_s.total_return:+.1%}）"
+            f"（{out_s.period_pnl_jpy:+,.0f} 円 / {out_s.total_return:+.1%}）"
+        )
+    elif out_s.carried_in_trades and out_s.net_pnl_jpy > out_s.period_pnl_jpy * 2:
+        lines.append(
+            f"⚠️  後半の決済損益 {out_s.net_pnl_jpy:+,.0f} 円のうち、口座が実際に増えたのは"
+            f" {out_s.period_pnl_jpy:+,.0f} 円だけです。"
+            f"\n    差は前半のうちに積み上がっていた含み益を、後半に決済しただけのぶんです。"
+            f"\n    後半に建てた取引がどれだけ稼いだかは、この数字からは分かりません"
+            f"（{out_s.carried_in_trades} 件が前半からの持ち越し）。"
         )
     if out_s.expectancy_r <= 0:
         failures.append(f"アウトオブサンプルの期待値がマイナスです（{out_s.expectancy_r:+.2f} R）")
@@ -777,11 +823,20 @@ def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
                 f"（{out_s.total_return:+.1%} / 最大DD {out_s.max_drawdown:.1%}）"
             )
         elif out_s.total_return < bench_r:
+            # ドローダウン 1% あたり何 % 取れたか。投資額も損切りの有無も違う
+            # 両者を、同じ土俵で並べるためのいちばん素朴な物差し。
+            ratio = out_s.total_return / out_s.max_drawdown if out_s.max_drawdown > 0 else 0.0
+            bench_ratio = bench_r / bench_dd if bench_dd > 0 else 0.0
             lines.append(
                 f"⚠️  リターンでは買い持ち（{bench_r:+.1%}）に負けています"
                 f"（戦略 {out_s.total_return:+.1%}）。"
-                f" 最大DDは戦略 {out_s.max_drawdown:.1%} / 買い持ち {bench_dd:.1%} なので、"
-                " リスクを抑えたぶんの差である可能性はあります。"
+                f"\n    最大DDは戦略 {out_s.max_drawdown:.1%} / 買い持ち {bench_dd:.1%}。"
+                f"\n    リスク調整後（リターン ÷ 最大DD）: 戦略 {ratio:.2f} / 買い持ち {bench_ratio:.2f}"
+                + (
+                    "\n    → リスクを抑えたぶんを差し引いても、買い持ちに負けています。"
+                    if ratio < bench_ratio
+                    else "\n    → リスクあたりでは買い持ちを上回っています。"
+                )
             )
 
     # 上位数銘柄の当たりで成り立っていないか

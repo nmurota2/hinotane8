@@ -191,6 +191,8 @@ def _result(
     return SimpleNamespace(
         trades=list(range(n_trades)),
         net_pnl_jpy=net_pnl,
+        period_pnl_jpy=net_pnl,
+        carried_in_trades=0,
         expectancy_r=expectancy,
         profit_factor=pf,
         total_return=net_pnl / 1_000_000,
@@ -534,3 +536,50 @@ def test_position_sizing_does_not_compound(noise_cfg, db):
             f" 1銘柄あたりの上限 {cap:,.0f}円 を超えている。"
             " 増えた資金を基準に数量を計算している（複利）疑い。"
         )
+
+
+def test_profit_carried_over_from_the_first_half_is_not_counted_as_the_second_half():
+    """前半で積み上がった含み益を、後半の実績として数えないこと。
+
+    実際に起きた: 後半の「確定損益 +72,852 円」に対し、口座が実際に増えたのは
+    +1,215 円（+0.1%）だけだった。差は前半のうちに乗っていた含み益を後半に
+    決済したもの。決済額で合否を判定すると、後半に何も稼げていない戦略が
+    「後半も +72,852 円」として通ってしまう。
+    """
+    from hinotane.backtest import FAIL, judge
+
+    out = _result(net_pnl=72_852, expectancy=0.42, pf=2.17, n_trades=19)
+    out.period_pnl_jpy = -5_000      # 口座は実際には減っている
+    out.carried_in_trades = 6
+    out.total_return = -0.004
+
+    verdict, lines = judge(
+        _report(
+            _result(net_pnl=142_908, expectancy=0.91, pf=6.95, n_trades=19),
+            out,
+            in_window=400,
+        )
+    )
+    assert verdict == FAIL, f"実際には減っているのに落ちなかった: {lines}"
+    assert any("資産が減っています" in line for line in lines)
+
+
+def test_carried_over_profit_is_disclosed_even_when_positive():
+    """口座が増えていても、その大半が持ち越しの含み益なら必ず明示すること。"""
+    from hinotane.backtest import judge
+
+    out = _result(net_pnl=72_852, expectancy=0.42, pf=2.17, n_trades=19)
+    out.period_pnl_jpy = 1_215
+    out.carried_in_trades = 6
+    out.total_return = 0.001
+
+    _verdict, lines = judge(
+        _report(
+            _result(net_pnl=142_908, expectancy=0.91, pf=6.95, n_trades=19),
+            out,
+            in_window=400,
+        )
+    )
+    text = "\n".join(lines)
+    assert "持ち越し" in text, f"持ち越しの含み益を明示していない: {lines}"
+    assert "+1,215 円" in text
