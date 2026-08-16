@@ -19,6 +19,8 @@
     hinotane forward-start            紙トレードの記録を開始（開始日を固定）
     hinotane forward                  紙トレードの経過を買い持ちと並べて表示
     hinotane universe                 検証対象から何を落としているかを表示
+    hinotane backfill-listed          過去時点の上場一覧（上場廃止銘柄）を取得
+    hinotane backfill-fins            決算・財務情報を取得（Light 以上）
     hinotane serve                    LINE Webhook サーバーを起動
 """
 
@@ -402,6 +404,22 @@ def cmd_forward(args, cfg, db) -> int:
     return 0
 
 
+def cmd_backfill_listed(args, cfg, db) -> int:
+    """過去時点の上場銘柄一覧を取り込む（生存者バイアスを消す）。"""
+    from .pipeline import backfill_listed_history
+
+    backfill_listed_history(cfg, db, every_days=args.every_days)
+    return 0
+
+
+def cmd_backfill_fins(args, cfg, db) -> int:
+    """決算・財務情報を取り込む（Light プラン以上）。"""
+    from .pipeline import backfill_financials
+
+    backfill_financials(cfg, db)
+    return 0
+
+
 def cmd_universe(args, cfg, db) -> int:
     """検証対象から何を落としているのかを数字で出す。"""
     from .universe import report
@@ -495,6 +513,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     fw = sub.add_parser("forward", help="紙トレードの経過を表示")
     fw.set_defaults(func=cmd_forward)
+
+    bl = sub.add_parser("backfill-listed", help="過去時点の上場一覧を取得")
+    bl.add_argument("--every-days", type=int, default=30,
+                    help="何日おきに取得するか（既定30日＝月1回）")
+    bl.set_defaults(func=cmd_backfill_listed)
+
+    bf = sub.add_parser("backfill-fins", help="決算・財務情報を取得（Light以上）")
+    bf.set_defaults(func=cmd_backfill_fins)
 
     un = sub.add_parser("universe", help="検証対象から何を落としているかを表示")
     un.add_argument("--max-symbols", type=int, default=600)

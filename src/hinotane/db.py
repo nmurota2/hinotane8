@@ -103,6 +103,54 @@ CREATE TABLE IF NOT EXISTS runs (
     detail          VARCHAR
 );
 
+-- 過去時点の上場銘柄一覧（生存者バイアスを消すため）
+--
+-- `listed` は取得時点のスナップショットなので、途中で上場廃止になった銘柄が
+-- 入らない。検証を listed と JOIN すると、消えた銘柄が黙って対象外になり、
+-- 成績が実態より良く出る。新興株ほど影響が大きい。
+-- こちらは「その日に上場していた銘柄」を日付つきで持つ。
+CREATE TABLE IF NOT EXISTS listed_history (
+    as_of           DATE    NOT NULL,
+    code            VARCHAR NOT NULL,
+    name            VARCHAR,
+    market_code     VARCHAR,
+    sector17_code   VARCHAR,
+    sector33_code   VARCHAR,
+    scale_category  VARCHAR,
+    PRIMARY KEY (as_of, code)
+);
+
+-- 財務情報サマリ（/fins/summary）
+--
+-- ⚠️ 時点合わせは必ず disclosed_on（開示日）で行うこと。
+-- period_end（決算期末）で並べると、まだ公表されていない数字を見て
+-- 売買することになり、実在しない優位性が出る。
+CREATE TABLE IF NOT EXISTS financials (
+    code            VARCHAR NOT NULL,
+    disclosed_on    DATE    NOT NULL,
+    disclosed_at    VARCHAR,
+    doc_type        VARCHAR,
+    period_type     VARCHAR,
+    period_end      DATE,
+    fy_end          DATE,
+    sales                    DOUBLE,
+    operating_profit         DOUBLE,
+    ordinary_profit          DOUBLE,
+    net_profit               DOUBLE,
+    eps                      DOUBLE,
+    bps                      DOUBLE,
+    total_assets             DOUBLE,
+    equity                   DOUBLE,
+    equity_ratio             DOUBLE,
+    cf_operating             DOUBLE,
+    dividend_annual          DOUBLE,
+    forecast_sales           DOUBLE,
+    forecast_operating_profit DOUBLE,
+    forecast_net_profit      DOUBLE,
+    forecast_eps             DOUBLE,
+    PRIMARY KEY (code, disclosed_on, period_end)
+);
+
 -- 紙トレードの開始点。ここを固定しておかないと「いつから数えた成績か」が
 -- 後から動いてしまい、比較相手（買い持ち）と土俵が揃わなくなる。
 CREATE TABLE IF NOT EXISTS forward_test (
@@ -116,6 +164,8 @@ CREATE TABLE IF NOT EXISTS forward_test (
 CREATE INDEX IF NOT EXISTS idx_quotes_date ON daily_quotes(date);
 CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+CREATE INDEX IF NOT EXISTS idx_fin_disclosed ON financials(disclosed_on);
+CREATE INDEX IF NOT EXISTS idx_listed_hist ON listed_history(as_of);
 """
 
 
@@ -179,6 +229,58 @@ class Database:
             )
             conn.unregister("incoming")
         return len(df)
+
+    def upsert_listed_history(self, as_of, df: pd.DataFrame) -> int:
+        """ある日時点の上場銘柄一覧を保存する。"""
+        if df.empty:
+            return 0
+        frame = df.copy()
+        frame["as_of"] = as_of
+        with self.connect() as conn:
+            conn.register("incoming", frame)
+            conn.execute("DELETE FROM listed_history WHERE as_of = ?", [as_of])
+            conn.execute(
+                """
+                INSERT INTO listed_history
+                    (as_of, code, name, market_code, sector17_code,
+                     sector33_code, scale_category)
+                SELECT as_of, code, name, market_code, sector17_code,
+                       sector33_code, scale_category
+                FROM incoming
+                """
+            )
+            conn.unregister("incoming")
+        return len(frame)
+
+    def upsert_financials(self, df: pd.DataFrame) -> int:
+        if df.empty:
+            return 0
+        cols = [
+            "code", "disclosed_on", "disclosed_at", "doc_type", "period_type",
+            "period_end", "fy_end", "sales", "operating_profit", "ordinary_profit",
+            "net_profit", "eps", "bps", "total_assets", "equity", "equity_ratio",
+            "cf_operating", "dividend_annual", "forecast_sales",
+            "forecast_operating_profit", "forecast_net_profit", "forecast_eps",
+        ]
+        frame = df.reindex(columns=cols)
+        # 主キーに使う period_end が欠けている行は、時点を特定できないので捨てる
+        frame = frame.dropna(subset=["code", "disclosed_on", "period_end"])
+        if frame.empty:
+            return 0
+        with self.connect() as conn:
+            conn.register("incoming", frame)
+            conn.execute(
+                """
+                DELETE FROM financials WHERE (code, disclosed_on, period_end) IN
+                    (SELECT code, disclosed_on, period_end FROM incoming)
+                """
+            )
+            conn.execute(
+                f"INSERT INTO financials ({','.join(cols)}) "
+                f"SELECT {','.join(cols)} FROM incoming"
+            )
+            conn.unregister("incoming")
+        return len(frame)
 
     def execute(self, sql: str, params: list | tuple | None = None) -> None:
         with self.connect() as conn:

@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 
 EQ_MASTER_PATH = "/equities/master"
 EQ_BARS_DAILY_PATH = "/equities/bars/daily"
+FIN_SUMMARY_PATH = "/fins/summary"
 
 # 正規化後の名前 -> API が返しうる名前の候補（優先度順）。
 #
@@ -45,6 +46,38 @@ _QUOTE_COLUMNS: dict[str, tuple[str, ...]] = {
     "close": ("AdjC", "C", "AdjustmentClose", "Close"),
     "volume": ("AdjVo", "Vo", "AdjustmentVolume", "Volume"),
     "turnover_value": ("Va", "TurnoverValue"),
+}
+
+#: 財務情報サマリ（/fins/summary）。Light プラン以上で取得できる。
+#:
+#: ⚠️ 使うときは **開示日（disclosed_on）** で時点を合わせること。
+#: 決算期末（period_end）で並べると、まだ公表されていない数字を
+#: 見て売買することになる。日本株の決算は期末から 30〜45 日後の開示が普通なので、
+#: ここを取り違えると、実在しない優位性が出る。
+_FIN_COLUMNS: dict[str, tuple[str, ...]] = {
+    "code": ("Code",),
+    "disclosed_on": ("DiscDate",),
+    "disclosed_at": ("DiscTime",),
+    "doc_type": ("DocType",),
+    "period_type": ("CurPerType",),
+    "period_end": ("CurPerEn",),
+    "fy_end": ("CurFYEn",),
+    "sales": ("Sales",),
+    "operating_profit": ("OP",),
+    "ordinary_profit": ("OdP",),
+    "net_profit": ("NP",),
+    "eps": ("EPS",),
+    "bps": ("BPS",),
+    "total_assets": ("TA",),
+    "equity": ("Eq",),
+    "equity_ratio": ("EqAR",),
+    "cf_operating": ("CFO",),
+    "dividend_annual": ("DivAnn",),
+    # 会社予想。実績との差（サプライズ）や、予想の修正を測るのに使う。
+    "forecast_sales": ("FSales",),
+    "forecast_operating_profit": ("FOP",),
+    "forecast_net_profit": ("FNP",),
+    "forecast_eps": ("FEPS",),
 }
 
 _LISTED_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -341,6 +374,29 @@ class JQuantsClient:
         df = _normalize(pd.DataFrame(rows), _LISTED_COLUMNS, required={"code", "name"})
         df["code"] = df["code"].astype(str)
         return df.drop_duplicates(subset=["code"], keep="last")
+
+    def financials_by_date(self, target: date) -> pd.DataFrame:
+        """特定日に開示された財務情報（V2: /fins/summary）。
+
+        日付単位で取ると 1 リクエストでその日の全開示が取れる。
+        銘柄単位で取ると 4,000 回の往復になるので、取り込みはこちらを使う。
+        """
+        rows = self._get(FIN_SUMMARY_PATH, {"date": target.strftime("%Y-%m-%d")})
+        if not rows:
+            return pd.DataFrame(columns=list(_FIN_COLUMNS))
+        df = _normalize(pd.DataFrame(rows), _FIN_COLUMNS, required={"code", "disclosed_on"})
+        df["code"] = df["code"].astype(str)
+        df["disclosed_on"] = pd.to_datetime(df["disclosed_on"], errors="coerce").dt.date
+        for col in ("period_end", "fy_end"):
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+        numeric = [
+            c for c in _FIN_COLUMNS
+            if c not in ("code", "disclosed_on", "disclosed_at", "doc_type",
+                         "period_type", "period_end", "fy_end")
+        ]
+        for col in numeric:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df.dropna(subset=["disclosed_on"]).reset_index(drop=True)
 
     def daily_quotes_by_date(self, target: date) -> pd.DataFrame:
         """特定日の全銘柄日足。日次更新はこちらが効率的（1 リクエストで全銘柄）。"""

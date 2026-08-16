@@ -444,3 +444,153 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
 
     _log_run(db, "mark", started, True, f"{closed}件を決済")
     return closed
+
+
+def backfill_listed_history(cfg: AppConfig, db: Database, *, every_days: int = 30) -> int:
+    """過去時点の上場銘柄一覧を取り込む（生存者バイアスを消すため）。
+
+    `listed` は取得時点のスナップショットなので、途中で上場廃止になった銘柄が
+    入らない。検証は `listed` と JOIN しているため、**消えた銘柄は黙って対象外**
+    になり、成績が実態より良く出る。新興株ほど上場廃止が多いので影響は大きい。
+
+    `/equities/master` は日付を指定できるので、月に 1 回ぶん取り直せば
+    「その時点で上場していた銘柄」が分かる。5 年で 60 回程度、数分で終わる。
+    """
+    started = now()
+    client = JQuantsClient(cfg.jquants)
+
+    span = db.query("SELECT min(date) AS lo, max(date) AS hi FROM daily_quotes")
+    if span.empty or pd.isna(span.iloc[0]["lo"]):
+        log.warning("株価データがありません。先に backfill を実行してください。")
+        _log_run(db, "listed_history", started, False, "株価データなし")
+        return 0
+    lo = pd.Timestamp(span.iloc[0]["lo"]).date()
+    hi = pd.Timestamp(span.iloc[0]["hi"]).date()
+
+    known = db.query("SELECT DISTINCT as_of FROM listed_history")
+    already: set[date] = (
+        set(pd.to_datetime(known["as_of"]).dt.date) if not known.empty else set()
+    )
+
+    targets: list[date] = []
+    cursor = lo
+    while cursor <= hi:
+        if cursor not in already:
+            targets.append(cursor)
+        cursor += timedelta(days=every_days)
+    if hi not in already and hi not in targets:
+        targets.append(hi)
+
+    if not targets:
+        log.info("過去の上場銘柄一覧はすべて取得済みです")
+        _log_run(db, "listed_history", started, True, "取得済み")
+        return 0
+
+    eta = len(targets) * cfg.jquants.min_request_interval_sec / 60.0
+    log.info(
+        "%s 〜 %s を %d 日おきに %d 回取得します（およそ %.0f 分）",
+        lo, hi, every_days, len(targets), eta,
+    )
+
+    total = 0
+    for i, target in enumerate(targets, start=1):
+        try:
+            df = client.listed_info(target)
+        except Exception as exc:
+            log.warning("%s の上場一覧取得に失敗（スキップ）: %s", target, exc)
+            continue
+        total += db.upsert_listed_history(target, df)
+        if i % max(len(targets) // 10, 1) == 0 or i == len(targets):
+            log.info("進捗 %d/%d  %s まで完了 / 累計 %s 件", i, len(targets), target, f"{total:,}")
+
+    # 効果を数字で出す。何件が「いま消えている銘柄」なのかが本題。
+    gap = db.query(
+        """
+        SELECT count(DISTINCT h.code) AS n
+        FROM listed_history h
+        LEFT JOIN listed l ON l.code = h.code
+        WHERE l.code IS NULL
+        """
+    ).iloc[0]["n"]
+    log.info("過去の上場一覧を取得しました: %s 件", f"{total:,}")
+    log.info(
+        "→ うち %d 銘柄は現在の上場一覧に存在しません（上場廃止など）。"
+        " これまでの検証はこの銘柄群を黙って除外していました。",
+        int(gap),
+    )
+    _log_run(db, "listed_history", started, True, f"{total}件 / 消滅 {int(gap)}銘柄")
+    return total
+
+
+def backfill_financials(cfg: AppConfig, db: Database) -> int:
+    """財務情報サマリを取り込む（Light プラン以上）。
+
+    決算の開示日単位で取る。1 リクエストでその日の全開示が返るので、
+    5 年ぶんでも営業日数ぶんの往復で済む。
+
+    ⚠️ 使うときは必ず **開示日** で時点を合わせること。決算期末で並べると、
+    まだ公表されていない数字を見て売買することになる。
+    """
+    started = now()
+    client = JQuantsClient(cfg.jquants)
+
+    span = db.query("SELECT min(date) AS lo, max(date) AS hi FROM daily_quotes")
+    if span.empty or pd.isna(span.iloc[0]["lo"]):
+        log.warning("株価データがありません。先に backfill を実行してください。")
+        _log_run(db, "financials", started, False, "株価データなし")
+        return 0
+    lo = pd.Timestamp(span.iloc[0]["lo"]).date()
+    hi = pd.Timestamp(span.iloc[0]["hi"]).date()
+
+    known = db.query("SELECT DISTINCT disclosed_on FROM financials")
+    already: set[date] = (
+        set(pd.to_datetime(known["disclosed_on"]).dt.date) if not known.empty else set()
+    )
+
+    targets: list[date] = []
+    cursor = lo
+    while cursor <= hi:
+        if cursor.weekday() < 5 and cursor not in already:
+            targets.append(cursor)
+        cursor += timedelta(days=1)
+
+    if not targets:
+        log.info("財務情報はすべて取得済みです")
+        _log_run(db, "financials", started, True, "取得済み")
+        return 0
+
+    eta = len(targets) * cfg.jquants.min_request_interval_sec / 60.0
+    log.info(
+        "%s 〜 %s の %d 営業日ぶんの決算開示を取得します（およそ %.0f 分）",
+        targets[0], targets[-1], len(targets), eta,
+    )
+    if cfg.jquants.requests_per_min <= 5:
+        log.warning(
+            "財務情報は Light プラン以上が必要です。"
+            " Free プランのままだと空で返り続けます。"
+        )
+
+    total = 0
+    report_every = max(len(targets) // 20, 1)
+    for i, target in enumerate(targets, start=1):
+        try:
+            df = client.financials_by_date(target)
+        except JQuantsOutOfRangeError as exc:
+            log.info(
+                "%s は契約プランのデータ提供範囲外です（%s 〜 %s）。取得を打ち切ります。",
+                target, exc.covered_from, exc.covered_to,
+            )
+            break
+        except Exception as exc:
+            log.warning("%s の財務情報取得に失敗（スキップ）: %s", target, exc)
+            continue
+        total += db.upsert_financials(df)
+        if i % report_every == 0 or i == len(targets):
+            log.info(
+                "進捗 %d/%d（%.0f%%） %s まで完了 / 累計 %s 件",
+                i, len(targets), i / len(targets) * 100, target, f"{total:,}",
+            )
+
+    log.info("財務情報の取得完了: %s 件", f"{total:,}")
+    _log_run(db, "financials", started, True, f"{total}件")
+    return total

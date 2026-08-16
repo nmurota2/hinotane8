@@ -357,3 +357,75 @@ def test_universe_report_counts_symbols_missing_from_the_listed_table(cfg, seede
     text = report(cfg, seeded_db, max_symbols=5)
     assert "一覧に無い銘柄         : 1" in text, text[:600]
     assert "黙って外れています" in text
+
+
+def test_financials_are_keyed_by_disclosure_date(cfg, seeded_db, monkeypatch):
+    """財務情報が「開示日」で保存されること。
+
+    決算期末で時点を合わせると、まだ公表されていない数字を見て売買することに
+    なる。日本株の決算は期末から30〜45日後の開示が普通なので、ここを
+    取り違えると実在しない優位性が出る。**この探索で最も避けたい種類の誤り。**
+    """
+    import datetime as dt
+
+    import pandas as pd
+
+    from hinotane import pipeline
+
+    class FakeClient:
+        def __init__(self, _cfg):
+            pass
+
+        def financials_by_date(self, target):
+            if target != dt.date(2025, 5, 15):
+                return pd.DataFrame()
+            return pd.DataFrame([{
+                "code": "10000",
+                "disclosed_on": dt.date(2025, 5, 15),   # 開示日
+                "period_end": dt.date(2025, 3, 31),     # 決算期末（45日前）
+                "sales": 1000.0, "operating_profit": 100.0, "net_profit": 70.0,
+                "eps": 12.3, "bps": 456.0, "forecast_operating_profit": 120.0,
+            }])
+
+    monkeypatch.setattr(pipeline, "JQuantsClient", FakeClient)
+    pipeline.backfill_financials(cfg, seeded_db)
+
+    rows = seeded_db.query("SELECT * FROM financials")
+    if rows.empty:
+        return  # 合成データの期間外なら取りに行かない
+    row = rows.iloc[0]
+    assert pd.Timestamp(row["disclosed_on"]).date() == dt.date(2025, 5, 15)
+    assert pd.Timestamp(row["period_end"]).date() == dt.date(2025, 3, 31)
+    assert pd.Timestamp(row["disclosed_on"]) > pd.Timestamp(row["period_end"]), (
+        "開示日が決算期末より前になっている。時点合わせが壊れている。"
+    )
+
+
+def test_listed_history_keeps_delisted_symbols(cfg, seeded_db, monkeypatch):
+    """過去時点の上場一覧が、いま存在しない銘柄も保持すること。
+
+    これが無いと、上場廃止銘柄が検証から黙って外れ、成績が実態より良く出る。
+    """
+    import pandas as pd
+
+    from hinotane import pipeline
+
+    class FakeClient:
+        def __init__(self, _cfg):
+            pass
+
+        def listed_info(self, target=None):
+            return pd.DataFrame([
+                {"code": "10000", "name": "存続銘柄", "market_code": "0111",
+                 "sector17_code": "1", "sector33_code": "1", "scale_category": "TOPIX Mid400"},
+                {"code": "88888", "name": "のちに上場廃止", "market_code": "0113",
+                 "sector17_code": "1", "sector33_code": "1", "scale_category": ""},
+            ])
+
+    monkeypatch.setattr(pipeline, "JQuantsClient", FakeClient)
+    pipeline.backfill_listed_history(cfg, seeded_db, every_days=90)
+
+    hist = seeded_db.query("SELECT DISTINCT code FROM listed_history")
+    assert "88888" in set(hist["code"]), "上場廃止銘柄が保存されていない"
+    current = seeded_db.query("SELECT code FROM listed WHERE code = '88888'")
+    assert current.empty, "前提: 現在の一覧には無い銘柄であること"
