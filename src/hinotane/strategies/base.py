@@ -55,6 +55,11 @@ class Strategy(ABC):
     label: str = ""
     max_holding_days: int = 20
 
+    #: トレーリングストップの ATR 倍率。None なら固定ストップ。
+    #: エントリー後の最高値から この倍率×ATR 下に損切りを切り上げていく。
+    #: 上げ相場で勝ち馬を早々に手放さないための仕組み。
+    trailing_atr_mult: float | None = None
+
     #: 判定に必要な最低バー数
     warmup_bars: int = 80
 

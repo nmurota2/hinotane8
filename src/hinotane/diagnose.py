@@ -125,8 +125,8 @@ def diagnose(
     out.append("=" * 62)
     reasons = Counter(t.exit_reason for t in result.trades)
     total = sum(reasons.values()) or 1
-    label = {"stop": "損切り", "target": "利確", "timeout": "時間切れ"}
-    for reason in ("stop", "target", "timeout"):
+    label = {"stop": "損切り", "target": "利確", "timeout": "時間切れ", "期末": "期末持越"}
+    for reason in ("stop", "target", "timeout", "期末"):
         n = reasons.get(reason, 0)
         ts = [t for t in result.trades if t.exit_reason == reason]
         pnl = sum(t.pnl_jpy for t in ts)
@@ -138,6 +138,11 @@ def diagnose(
         out.append("  → ⚠️ 損切りが過半。損切り幅が狭すぎて、ノイズで振り落とされている疑い。")
     if timeout_rate > 0.35:
         out.append("  → ⚠️ 時間切れが多い。利確目標が遠すぎるか、そもそも動かない銘柄を掴んでいる。")
+    if reasons.get("期末", 0) / total > 0.25:
+        out.append(
+            "  → ⚠️ 期末持越が多い。検証期間が戦略の保有期間に対して短く、"
+            "成績が途中経過に近い。データ期間を延ばすまで数字は仮のもの。"
+        )
 
     holding = [
         (t.exit_date - t.entry_date).days for t in result.trades if t.exit_date and t.entry_date

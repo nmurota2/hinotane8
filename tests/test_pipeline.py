@@ -135,7 +135,7 @@ def test_backtest_produces_consistent_metrics(cfg, seeded_db):
         # 損益と R 倍率の符号は必ず一致する
         assert (t.pnl_jpy > 0) == (t.r_multiple > 0) or t.pnl_jpy == 0
         assert t.exit_date >= t.entry_date
-        assert t.exit_reason in {"stop", "target", "timeout"}
+        assert t.exit_reason in {"stop", "target", "timeout", "期末"}
 
 
 def _fake_backfill(cfg, db, monkeypatch, years=2.0):

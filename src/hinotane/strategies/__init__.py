@@ -10,6 +10,7 @@ from .base import Strategy, StrategySignal, available, get_strategy, register
 from .breakout import BreakoutStrategy
 from .pullback import PullbackStrategy
 from .reversal import ReversalStrategy
+from .trend import TrendStrategy
 
 __all__ = [
     "BreakoutStrategy",
@@ -17,6 +18,7 @@ __all__ = [
     "ReversalStrategy",
     "Strategy",
     "StrategySignal",
+    "TrendStrategy",
     "available",
     "get_strategy",
     "register",

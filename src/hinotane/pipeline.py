@@ -24,6 +24,7 @@ from .datasource.jquants import (
     display_code,
 )
 from .db import Database
+from .indicators import enrich
 from .notify import console
 from .notify.line import LineNotifier
 from .screener import screen_and_size
@@ -337,16 +338,27 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
         if bars.empty:
             continue
 
+        # トレーリングに使う ATR。指標は enrich() で一括計算する。
+        atr_by_date: dict = {}
+        if len(bars) > 1:
+            history = db.bars(str(pos["code"]), limit=400)
+            if len(history) >= 20:
+                enriched = enrich(history)
+                atr_by_date = dict(zip(enriched["date"], enriched["atr14"], strict=True))
+
         try:
-            max_days = get_strategy(str(pos["strategy"])).max_holding_days
+            strategy = get_strategy(str(pos["strategy"]))
+            max_days = strategy.max_holding_days
+            trailing = strategy.trailing_atr_mult
         except KeyError:
-            max_days = 20
+            max_days, trailing = 20, None
 
         stop = float(pos["stop_price"])
         target = float(pos["target_price"])
         exit_price: float | None = None
         exit_reason = ""
 
+        highest = float(pos["entry_price"])
         for held, (_, bar) in enumerate(bars.iterrows()):
             bar_open = float(bar["open"])
             if bar["low"] <= stop:
@@ -360,6 +372,13 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
             if held >= max_days:
                 exit_price, exit_reason = float(bar["close"]), "timeout"
                 break
+
+            # 決済しなかった日だけ損切りを切り上げる（バックテストと同じ順序）
+            if trailing:
+                highest = max(highest, float(bar["high"]))
+                atr_now = atr_by_date.get(bar["date"], 0.0)
+                if atr_now > 0:
+                    stop = max(stop, highest - trailing * atr_now)
 
         if exit_price is None:
             continue

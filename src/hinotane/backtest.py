@@ -171,7 +171,9 @@ def _build_signal_table(
         in_range = enriched["close"].between(sc.min_price, sc.max_price)
         tradable = liquid & in_range
 
-        prices[code] = enriched.set_index("date")[["open", "high", "low", "close"]]
+        prices[code] = enriched.set_index("date")[
+            ["open", "high", "low", "close", "atr14"]
+        ]
 
         for strategy in strategies:
             out = strategy.evaluate(enriched)
@@ -189,6 +191,7 @@ def _build_signal_table(
                         "target_price": hit["target_price"],
                         "score": hit["score"],
                         "max_holding_days": strategy.max_holding_days,
+                        "trailing_atr_mult": strategy.trailing_atr_mult,
                     }
                 )
             )
@@ -197,6 +200,42 @@ def _build_signal_table(
         return pd.DataFrame(), prices, names
     table = pd.concat(rows, ignore_index=True).sort_values(["date", "score"], ascending=[True, False])
     return table, prices, names
+
+
+def _close_position(
+    pos: dict,
+    *,
+    exit_price: float,
+    exit_date: date,
+    exit_reason: str,
+    slip: float,
+    fee: float,
+    names: dict[str, str],
+) -> Trade:
+    """建玉を 1 件決済して Trade を作る。
+
+    手仕舞いの計算（スリッページ・手数料・R 倍率）を 1 か所に集約しておく。
+    通常の決済と期末の強制決済で計算式がずれると、そこが成績の嘘になる。
+    """
+    fill = exit_price * (1 - slip)
+    gross = (fill - pos["entry_price"]) * pos["quantity"]
+    commission = (fill + pos["entry_price"]) * pos["quantity"] * fee
+    pnl = gross - commission
+    risk = (pos["entry_price"] - pos["initial_stop"]) * pos["quantity"]
+    return Trade(
+        code=pos["code"],
+        name=str(names.get(pos["code"], pos["code"])),
+        strategy=pos["strategy"],
+        entry_date=pos["entry_date"],
+        entry_price=pos["entry_price"],
+        exit_date=exit_date,
+        exit_price=fill,
+        quantity=pos["quantity"],
+        pnl_jpy=pnl,
+        risk_jpy=risk,
+        r_multiple=pnl / risk if risk > 0 else 0.0,
+        exit_reason=exit_reason,
+    )
 
 
 def run_backtest(
@@ -283,6 +322,7 @@ def run_backtest(
                     if qty < lot:
                         continue
 
+                    trail = sig.get("trailing_atr_mult")
                     open_positions.append(
                         {
                             "code": code,
@@ -291,8 +331,14 @@ def run_backtest(
                             "entry_price": entry_price,
                             "quantity": qty,
                             "stop": stop,
+                            # R 倍率の分母は「最初に決めた損切り幅」で固定する。
+                            # トレーリングで stop が動くと、あとから R の意味が
+                            # 変わってしまい成績の比較ができなくなる。
+                            "initial_stop": stop,
                             "target": float(sig["target_price"]),
                             "max_holding_days": int(sig["max_holding_days"]),
+                            "trailing_atr_mult": None if pd.isna(trail) else trail,
+                            "highest": entry_price,
                         }
                     )
                     held_codes.add(code)
@@ -329,32 +375,30 @@ def run_backtest(
                 exit_price, exit_reason = float(bar["close"]), "timeout"
 
             if exit_price is None:
+                # 決済しなかった場合だけ、損切りラインを切り上げる。
+                # 判定より先に更新すると、その日の高値を使って
+                # その日の安値を判定することになり未来を覗いてしまう。
+                mult = pos.get("trailing_atr_mult")
+                if mult:
+                    pos["highest"] = max(pos["highest"], float(bar["high"]))
+                    atr_now = float(bar["atr14"]) if pd.notna(bar["atr14"]) else 0.0
+                    if atr_now > 0:
+                        # 損切りは切り上げるだけ。下げると損失が青天井になる。
+                        pos["stop"] = max(pos["stop"], pos["highest"] - mult * atr_now)
                 still_open.append(pos)
                 continue
 
-            fill = exit_price * (1 - slip)
-            gross = (fill - pos["entry_price"]) * pos["quantity"]
-            commission = (fill + pos["entry_price"]) * pos["quantity"] * fee
-            pnl = gross - commission
-            equity += pnl
-            risk = (pos["entry_price"] - pos["stop"]) * pos["quantity"]
-
-            trades.append(
-                Trade(
-                    code=pos["code"],
-                    name=str(names.get(pos["code"], pos["code"])),
-                    strategy=pos["strategy"],
-                    entry_date=pos["entry_date"],
-                    entry_price=pos["entry_price"],
-                    exit_date=today,
-                    exit_price=fill,
-                    quantity=pos["quantity"],
-                    pnl_jpy=pnl,
-                    risk_jpy=risk,
-                    r_multiple=pnl / risk if risk > 0 else 0.0,
-                    exit_reason=exit_reason,
-                )
+            trade = _close_position(
+                pos,
+                exit_price=exit_price,
+                exit_date=today,
+                exit_reason=exit_reason,
+                slip=slip,
+                fee=fee,
+                names=names,
             )
+            equity += trade.pnl_jpy
+            trades.append(trade)
         open_positions = still_open
 
         # ---- 3. 時価評価 ------------------------------------------------
@@ -365,6 +409,40 @@ def run_backtest(
                 unrealized += (float(df.loc[today, "close"]) - pos["entry_price"]) * pos["quantity"]
         curve.append((today, equity + unrealized))
 
+    # ---- 4. 期末に残っている建玉を、最終日の終値で決済する ----------------
+    #
+    # ⚠️ これをやらないと成績が体系的に歪む。
+    # 集計（確定損益・プロフィットファクター・期待値）は決済済みの取引しか
+    # 数えないため、期末に持ち越した建玉は丸ごと集計から消える。
+    # ところが「持ち越しているもの」は伸びている勝ち馬に偏り、
+    # 「決済済みのもの」は損切りされた負けに偏る。
+    # つまり勝ちだけが集計から抜け落ちる。
+    # 保有期間の長い順張り戦略ほどこの歪みは大きく、
+    # 本当は機能している戦略を「負け」と誤判定しかねない。
+    if open_positions and all_dates:
+        last_day = all_dates[-1]
+        for pos in open_positions:
+            df = prices[pos["code"]]
+            available = df.loc[df.index <= last_day]
+            if available.empty:
+                continue
+            trade = _close_position(
+                pos,
+                exit_price=float(available["close"].iloc[-1]),
+                exit_date=available.index[-1],
+                exit_reason="期末",
+                slip=slip,
+                fee=fee,
+                names=names,
+            )
+            equity += trade.pnl_jpy
+            trades.append(trade)
+        open_positions = []
+        # 建玉を落としたので、最終日の資産は評価損益込みではなく確定額になる。
+        if curve:
+            curve[-1] = (curve[-1][0], equity)
+
+    trades.sort(key=lambda t: (t.exit_date, t.entry_date))
     equity_curve = pd.Series(dict(curve)).sort_index()
     return BacktestResult(
         label=label,

@@ -67,6 +67,8 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     out["sma5"] = sma(close, 5)
     out["sma25"] = sma(close, 25)
     out["sma75"] = sma(close, 75)
+    out["sma50"] = sma(close, 50)
+    out["sma200"] = sma(close, 200)
     out["ema20"] = ema(close, 20)
     out["rsi14"] = rsi(close, 14)
     out["atr14"] = atr(high, low, close, 14)
@@ -82,5 +84,10 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
     # 直近 60 営業日の騰落率（モメンタム）
     out["mom60"] = close / close.shift(60) - 1.0
     out["mom20"] = close / close.shift(20) - 1.0
+    # 相対的な強さの尺度。半年ぶんの上昇率で、直近1か月は除く。
+    # 直近は反落しやすいので外すのが定石（12-1 モメンタム）。
+    out["mom120"] = close.shift(20) / close.shift(140) - 1.0
+    out["high120"] = rolling_max(high, 120)
+    out["high50"] = rolling_max(high, 50)
 
     return out

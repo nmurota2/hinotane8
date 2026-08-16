@@ -258,3 +258,73 @@ def test_expectancy_sign_always_matches_the_money(noise_cfg, db):
     assert (r.expectancy_r > 0) == (r.net_pnl_jpy > 0), (
         f"期待値 {r.expectancy_r:+.3f}R と損益 {r.net_pnl_jpy:+,.0f}円 の符号が食い違っている"
     )
+
+
+# ------------------------------------------------- 期末に残った建玉の扱い
+
+
+def _rising_market(db: Database, n_codes: int = 40, n_days: int = 340, seed: int = 3) -> None:
+    """はっきりと右肩上がりの市場。順張りが建玉を持ち越す状況を作る。"""
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2024-01-01", periods=n_days).date
+    codes = [f"{3000 + i}0" for i in range(n_codes)]
+    db.upsert_listed(
+        pd.DataFrame(
+            {
+                "code": codes,
+                "name": [f"上昇{i}" for i in range(n_codes)],
+                "market_code": "0111",
+                "sector17_code": "1",
+                "sector33_code": "1",
+                "scale_category": "TOPIX Mid400",
+            }
+        )
+    )
+    steps = rng.normal(0.0018, 0.012, (n_codes, n_days))
+    close = 1500 * np.exp(np.cumsum(steps, axis=1))
+    open_ = close * (1 + rng.normal(0, 0.003, close.shape))
+    high = np.maximum(close, open_) * (1 + np.abs(rng.normal(0, 0.005, close.shape)))
+    low = np.minimum(close, open_) * (1 - np.abs(rng.normal(0, 0.005, close.shape)))
+    volume = rng.integers(300_000, 3_000_000, close.shape).astype(float)
+    db.upsert_quotes(
+        pd.DataFrame(
+            {
+                "code": np.repeat(np.array(codes), n_days),
+                "date": np.tile(dates, n_codes),
+                "open": open_.ravel(),
+                "high": high.ravel(),
+                "low": low.ravel(),
+                "close": close.ravel(),
+                "volume": volume.ravel(),
+                "turnover_value": (close * volume).ravel(),
+            }
+        )
+    )
+
+
+def test_positions_held_at_the_end_are_not_dropped(noise_cfg, db):
+    """検証期間の終わりに残った建玉を、集計から取りこぼさないこと。
+
+    集計（確定損益・プロフィットファクター・期待値）は決済済みの取引しか
+    数えない。期末の建玉を放置すると、**伸びている勝ち馬だけが集計から消え、
+    損切りされた負けは全部数えられる**という偏りが生まれる。
+    保有期間の長い順張り戦略ほど不当に悪く見え、
+    本当は機能している戦略を捨てることになる。
+    """
+    _rising_market(db)
+    cfg = replace(
+        noise_cfg, screener=replace(noise_cfg.screener, strategies=["trend"])
+    )
+    result = run_backtest(cfg, db, label="上昇市場", max_symbols=40)
+
+    assert result.trades, "取引が 1 件も発生せず、検証になっていない"
+    assert any(t.exit_reason == "期末" for t in result.trades), (
+        "右肩上がりの市場で順張りが 1 件も持ち越していない。テストの前提が崩れている。"
+    )
+    assert result.net_pnl_jpy == pytest.approx(
+        result.final_equity - result.initial_equity, abs=1.0
+    ), (
+        f"確定損益 {result.net_pnl_jpy:+,.0f}円 と資産の増減"
+        f" {result.final_equity - result.initial_equity:+,.0f}円 が一致しない。"
+        " 集計されていない建玉が残っている。"
+    )
