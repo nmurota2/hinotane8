@@ -105,10 +105,12 @@ class JQuantsConfig:
     # 上位プランなら .env の JQUANTS_REQUESTS_PER_MIN を上げると取得が速くなる。
     requests_per_min: int = _int("JQUANTS_REQUESTS_PER_MIN", 5)
 
-    # 上限ちょうどの間隔だと、サーバ側の集計の切れ目で弾かれることがある
-    # （実機では 5 回/分の設定でも開始 46 秒で 429 になった）。
-    # 1 回弾かれると 60 秒待たされるので、少し余裕を持たせたほうが結局速い。
-    rate_safety_margin: float = _float("JQUANTS_RATE_SAFETY_MARGIN", 1.2)
+    # 上限ちょうどの間隔で撃つと弾かれる。
+    # 例えば 5 回/分なら理論上は 12 秒間隔だが、それだと 60 秒の窓に
+    # ちょうど 5 回入ってしまい境界で 429 になる（実機で確認）。
+    # 1.35 倍（= 16.2 秒間隔）なら 60 秒の窓に 4 回しか入らず安全。
+    # 1 回弾かれるたびに 60 秒止まるので、間隔を widen したほうが結局速い。
+    rate_safety_margin: float = _float("JQUANTS_RATE_SAFETY_MARGIN", 1.35)
 
     @property
     def configured(self) -> bool:

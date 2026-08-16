@@ -125,10 +125,21 @@ class RateLimiter:
     Free は 5 回/分と厳しい。超えると 429 が返るだけでなく、
     大幅に超え続けると 5 分ほど完全にブロックされてしまう。
     後追いで再試行するより、最初から間隔を空けて叩くほうが速く確実に終わる。
+
+    サーバ側がどう数えているか（固定窓か移動窓か、境界を含むか）は
+    公開されていない。実機では「上限ちょうどに収まる間隔」でも弾かれた。
+    そこで **429 を食らうたびに間隔を自動的に広げる**。
+    推測した初期値が甘くても、数回で弾かれない速度に収束する。
     """
 
+    #: 429 のたびに間隔を何倍にするか
+    WIDEN_FACTOR = 1.25
+    #: 初期間隔の何倍まで広げてよいか（際限なく遅くしないための歯止め）
+    MAX_WIDEN = 4.0
+
     def __init__(self, min_interval_sec: float):
-        self.min_interval_sec = max(min_interval_sec, 0.0)
+        self.base_interval_sec = max(min_interval_sec, 0.0)
+        self.min_interval_sec = self.base_interval_sec
         self._last_request_at: float | None = None
 
     def wait(self) -> None:
@@ -138,6 +149,12 @@ class RateLimiter:
             if remaining > 0:
                 time.sleep(remaining)
         self._last_request_at = time.monotonic()
+
+    def widen(self) -> float:
+        """429 を食らったので間隔を広げる。新しい間隔を返す。"""
+        ceiling = self.base_interval_sec * self.MAX_WIDEN
+        self.min_interval_sec = min(self.min_interval_sec * self.WIDEN_FACTOR, ceiling)
+        return self.min_interval_sec
 
 
 # プロセス内でレート制限を共有する。fetch_listed と backfill のように
@@ -241,11 +258,14 @@ class JQuantsClient:
                 # 短い再試行ではなく、制限枠が空くまでしっかり待つ。
                 # 大幅超過を続けると 5 分ほどブロックされるため、徐々に延ばす。
                 wait_sec = _retry_after_seconds(resp) or min(60.0 * (attempt + 1), 300.0)
+                # 同じ間隔のままだと同じ場所でまた弾かれるので、次から間隔を広げる
+                new_interval = self._limiter.widen()
                 last_err = f"429 {resp.text[:120]}"
                 log.warning(
-                    "レート制限に達しました。%.0f 秒待機します"
-                    "（現在の設定: %d 回/分。Free プランの上限は 5 回/分です）",
+                    "レート制限に達しました。%.0f 秒待機し、以降は %.1f 秒間隔に広げます"
+                    "（上限の設定: %d 回/分）",
                     wait_sec,
+                    new_interval,
                     self.cfg.requests_per_min,
                 )
                 time.sleep(wait_sec)

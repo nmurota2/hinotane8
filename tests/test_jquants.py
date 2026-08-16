@@ -346,3 +346,40 @@ def test_listed_info_maps_v2_master_columns():
 )
 def test_display_code_strips_jquants_padding(raw, expected):
     assert display_code(raw) == expected
+
+
+# ------------------------------------------------- レート制限の自動調整
+
+
+def test_widen_increases_interval_and_is_capped():
+    """429 のたびに間隔を広げるが、際限なく遅くはしない。"""
+    limiter = RateLimiter(10.0)
+    assert limiter.widen() == pytest.approx(12.5)
+    assert limiter.widen() == pytest.approx(15.625)
+
+    for _ in range(20):
+        limiter.widen()
+    assert limiter.min_interval_sec == pytest.approx(40.0), "上限（初期値の4倍）を超えている"
+
+
+def test_429_widens_the_interval_for_subsequent_requests(monkeypatch):
+    """同じ間隔のままだと同じ場所でまた弾かれるので、次から広げること。
+
+    実機では「上限ちょうどに収まる間隔」でも 429 になった。
+    サーバ側の数え方が不明でも、弾かれるたびに広げれば収束する。
+    """
+    monkeypatch.setattr("hinotane.datasource.jquants.time.sleep", lambda _: None)
+
+    limiter = RateLimiter(10.0)
+    session = FakeSession(
+        [
+            FakeResponse(429, text="Rate limit exceeded"),
+            FakeResponse(200, {"data": []}),
+        ]
+    )
+    cfg = JQuantsConfig(api_key="dummy-key", max_retries=3)
+    client = JQuantsClient(cfg, limiter=limiter)
+    client._session = session
+    client.listed_info()
+
+    assert limiter.min_interval_sec > 10.0, "429 を食らっても間隔が変わっていない"

@@ -129,8 +129,10 @@ def test_request_interval_keeps_a_safety_margin():
     from hinotane.config import JQuantsConfig
 
     cfg = JQuantsConfig(api_key="k", requests_per_min=5)
-    # 5 回/分 = 12 秒間隔。余裕を見て必ずそれより長くする
-    assert cfg.min_request_interval_sec > 12.0
+    # 60 秒の窓に上限ちょうど（5 回）入る間隔だと境界で弾かれる。
+    # 窓あたり 4 回以下に収まる間隔でなければならない。
+    assert cfg.min_request_interval_sec > 60.0 / 5, "上限ちょうどの間隔になっている"
+    assert cfg.min_request_interval_sec > 60.0 / 4 * 0.99, "60秒の窓に5回入ってしまう"
     # ただし極端に遅くはしない
     assert cfg.min_request_interval_sec < 20.0
 
