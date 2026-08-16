@@ -1,9 +1,20 @@
 # hinotane バッチスケジュール（コンテナ内 TZ = Asia/Tokyo）
 #
 #  16:00  fetch    引け後の日足を取得
+#  16:05  execute  承認済みシグナルを発注
 #  16:10  mark     建玉の損切り・利確・時間切れを判定して決済
 #  21:00  screen   スクリーニング → LINE に候補を配信
-#  08:50  execute  承認済みシグナルを発注（翌営業日の寄り付き前）
+#
+# ⚠️ execute が引け後にあるのは、いまの発注アダプタが PaperBroker（擬似約定）
+#    だから。PaperBroker は「シグナル日の翌営業日の始値」を日足から引いて
+#    約定させるので、その日の日足が DB に入った後でないと執行できない。
+#    以前は 08:50 に置いていたが、その時刻には当日の日足がまだ無いため
+#    **一度も執行に成功しない** 状態だった。
+#
+#    実際の証券会社 API をつないだら、execute は 08:50（寄り付き前）に戻すこと。
+#    そのときは本物の寄り成行注文になるので、当日の日足は要らない。
+#    なお承認が間に合わなかったシグナルは失敗扱いにせず承認済みのまま残るので、
+#    翌日の execute が拾う（pipeline.run_execute の retriable 処理）。
 #
 # 平日のみ動かす（月〜金 = 1-5）。祝日は J-Quants にデータが無く空振りするだけなので無害。
 
@@ -11,6 +22,6 @@ SHELL=/bin/sh
 PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 
  0 16 * * 1-5 cd /app && hinotane fetch   >> /app/logs/fetch.log   2>&1
+ 5 16 * * 1-5 cd /app && hinotane execute >> /app/logs/execute.log 2>&1
 10 16 * * 1-5 cd /app && hinotane mark    >> /app/logs/mark.log    2>&1
  0 21 * * 1-5 cd /app && hinotane screen  >> /app/logs/screen.log  2>&1
-50  8 * * 1-5 cd /app && hinotane execute >> /app/logs/execute.log 2>&1

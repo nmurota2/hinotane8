@@ -59,7 +59,8 @@ class PaperBroker(BrokerAdapter):
         if fill is None:
             return OrderResult(
                 False, None, None, 0,
-                "翌営業日の株価データがまだありません（データ取得後に再実行してください）",
+                "翌営業日の株価データがまだありません（取得され次第、自動で執行します）",
+                retriable=True,
             )
 
         fill_date, raw_price = fill

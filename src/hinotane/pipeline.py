@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from datetime import date, datetime, timedelta
 
@@ -284,6 +285,15 @@ def run_execute(cfg: AppConfig, db: Database) -> int:
                 signal_id=sid,
             )
         )
+        if not result.ok and result.retriable:
+            # ⚠️ ここを 'failed' にしてはいけない。
+            # 本番のスケジュールでは execute は当日の株価を取り込む前に走るため、
+            # 「翌営業日の始値がまだ無い」は毎回起きる。これを失敗として確定
+            # させると、'failed' は執行対象のステータスから外れているので、
+            # 承認したシグナルが二度と発注されずに黙って消える。
+            log.info("執行を保留（%s）: %s", result.message, row["code"])
+            continue
+
         db.execute(
             "UPDATE signals SET status = ? WHERE id = ?",
             ["executed" if result.ok else "failed", sid],
@@ -311,9 +321,11 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
     同じ日に損切りと利確の両方に触れた場合は、保守的に損切り側を採用する。
 
     バックテスト（backtest.py）と同じ約定モデルを使うこと。片方だけ甘いと、
-    検証結果と実運用の成績が食い違う。具体的には次の 2 点を揃えている:
+    検証結果と実運用の成績が食い違う。具体的には次の 3 点を揃えている:
       * **エントリー当日も判定対象に含める**（買った初日に損切りは普通に起きる）
-      * **ギャップを織り込む**（損切り価格を割って寄り付いたら約定は寄り値）
+      * **約定は判定した翌営業日の始値**（この関数は引け後に走るので、
+        損切り価格ちょうどで約定させるには逆指値注文が要る。まだ無い）
+      * **切り上げた損切り価格を DB に保存する**（翌日の判定が同じ前提で走るように）
     """
     started = now()
     broker = get_broker(cfg, db)
@@ -355,22 +367,20 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
 
         stop = float(pos["stop_price"])
         target = float(pos["target_price"])
-        exit_price: float | None = None
         exit_reason = ""
+        triggered_at: int | None = None   # 決済条件が成立したバーの位置
 
         highest = float(pos["entry_price"])
-        for held, (_, bar) in enumerate(bars.iterrows()):
-            bar_open = float(bar["open"])
+        rows = list(bars.iterrows())
+        for held, (_, bar) in enumerate(rows):
             if bar["low"] <= stop:
-                # 損切り価格を割って寄り付いたら、実際の約定は寄り値になる
-                exit_price, exit_reason = min(bar_open, stop), "stop"
+                exit_reason, triggered_at = "stop", held
                 break
             if bar["high"] >= target:
-                # 利確は指値。目標より上で寄り付いたらその寄り値
-                exit_price, exit_reason = max(bar_open, target), "target"
+                exit_reason, triggered_at = "target", held
                 break
             if held >= max_days:
-                exit_price, exit_reason = float(bar["close"]), "timeout"
+                exit_reason, triggered_at = "timeout", held
                 break
 
             # 決済しなかった日だけ損切りを切り上げる（バックテストと同じ順序）
@@ -380,8 +390,32 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
                 if atr_now > 0:
                     stop = max(stop, highest - trailing * atr_now)
 
-        if exit_price is None:
+        # 切り上がった損切り価格は必ず保存する。保存しないと、翌日この関数が
+        # 走り直したときに最初の損切り価格から計算をやり直すことになり、
+        # 「昨日は決済条件が成立していたのに今日は成立しない」が起きうる。
+        if trailing and stop > float(pos["stop_price"]):
+            db.execute(
+                "UPDATE positions SET stop_price = ? WHERE id = ?", [stop, pos["id"]]
+            )
+
+        if triggered_at is None:
             continue
+
+        # ⚠️ 約定は「条件が成立した翌営業日の始値」。
+        # この関数は引け後 16:10 に走るので、判定した時点で場は終わっている。
+        # 逆指値注文を市場に置く仕組みがまだ無いため（OrderRequest に逆指値の
+        # 欄が無い）、実際に出せる最速の注文は翌朝の寄り成行だけ。
+        # バックテスト（backtest.py）も同じモデルにしてある。
+        if triggered_at + 1 >= len(rows):
+            # まだ翌営業日のバーが無い。明日この関数が走ったときに約定させる。
+            log.info(
+                "%s は%s条件が成立。翌営業日の寄りで決済します。",
+                pos["code"], exit_reason,
+            )
+            continue
+        exit_price = float(rows[triggered_at + 1][1]["open"])
+        if not math.isfinite(exit_price) or exit_price <= 0:
+            exit_price = float(rows[triggered_at + 1][1]["close"])
 
         result = broker.sell(
             OrderRequest(

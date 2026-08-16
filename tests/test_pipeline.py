@@ -248,3 +248,33 @@ def test_backfill_stops_at_the_subscription_boundary(cfg, seeded_db, monkeypatch
     assert len(beyond) == 1, (
         f"境界を越えたあとも {len(beyond)} 回要求している（1 回で打ち切るべき）"
     )
+
+
+def test_signal_on_the_latest_bar_survives_until_data_arrives(cfg, seeded_db):
+    """当日のシグナルを執行しようとして株価がまだ無いとき、失敗で確定させないこと。
+
+    本番のスケジュールでは、screen が引け後に走るのでシグナル日は必ず DB の
+    最終バーの日付になる。その状態で execute を呼ぶと「翌営業日の始値」は
+    まだ存在しない。ここを 'failed' で確定させると、'failed' は執行対象の
+    ステータスから外れているため **承認したシグナルが二度と発注されず黙って
+    消える**。実際にこの状態で本番スケジュールが組まれていた。
+    """
+    accepted, _ = screen_and_size(cfg, seeded_db)
+    if not accepted:
+        return
+
+    sid = accepted[0].signal_key
+    dates = seeded_db.query("SELECT DISTINCT date FROM daily_quotes ORDER BY date")["date"]
+    last_bar = dates.iloc[-1]
+    seeded_db.execute(
+        "UPDATE signals SET signal_date = ?, status = 'approved', expires_at = ? WHERE id = ?",
+        [last_bar, datetime.now() + timedelta(hours=12), sid],
+    )
+
+    assert run_execute(cfg, seeded_db) == 0
+    status = seeded_db.query("SELECT status FROM signals WHERE id = ?", [sid]).iloc[0]["status"]
+    assert status == "approved", (
+        f"株価待ちのシグナルが '{status}' になっている。"
+        " 承認済みのまま残さないと、翌日の execute が拾えず永久に発注されない。"
+    )
+    assert seeded_db.query("SELECT * FROM positions WHERE signal_id = ?", [sid]).empty

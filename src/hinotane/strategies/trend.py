@@ -41,6 +41,7 @@ class TrendStrategy(Strategy):
 
     atr_stop_mult = 3.0        # ノイズの外に置く
     trailing_atr_mult = 3.0    # 同じ幅で切り上げていく
+    has_profit_target = False  # 利確目標は置かない。通知にも出さない
     max_daily_jump = 0.08
 
     def evaluate(self, df: pd.DataFrame) -> pd.DataFrame:

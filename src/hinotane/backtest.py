@@ -6,8 +6,17 @@
 
 約定の扱いも本番（PaperBroker）と揃えてある:
   - エントリー: シグナル翌営業日の **始値** × (1 + スリッページ)
-  - 決済      : 日足の **高値・安値** で損切り/利確の到達を判定
+  - 数量      : **シグナル日の終値** を基準に、固定の運用資金から計算
+  - 決済判定  : 日足の **高値・安値** で損切り/利確の到達を判定
+  - 決済約定  : 判定した **翌営業日の始値** × (1 - スリッページ)
   - 同じ日に損切りと利確の両方に触れたら **損切り側** を採用（保守的）
+
+⚠️ 決済が「損切り価格ちょうど」ではなく翌営業日の寄りである理由
+本番の `hinotane mark` は引け後 16:10 に走る。判定した時点で場は終わっており、
+出せる注文は翌朝の寄り成行だけ。逆指値注文を市場に置いておく仕組みは
+まだ無い（OrderRequest に逆指値の欄が無く、立花証券の実装も未完）。
+損切り価格ちょうどで約定すると仮定すると、**出せない注文を前提に成績を
+計算する**ことになる。逆指値を実装したら、ここも同時に直すこと。
 
 ⚠️ 生存者バイアスについて
 このバックテストは DB にある銘柄のみを対象にする。DB は「取得時点で上場している
@@ -58,6 +67,9 @@ class BacktestResult:
     final_equity: float
     trades: list[Trade] = field(default_factory=list)
     equity_curve: pd.Series = field(default_factory=pd.Series)
+    #: 同じ期間・同じ銘柄を等ウェイトで買い持ちした場合の資産推移。
+    #: 「戦略のおかげで儲かったのか、相場が上げただけなのか」を切り分ける。
+    benchmark_curve: pd.Series = field(default_factory=pd.Series)
 
     # ------------------------------------------------------------------ 指標
 
@@ -109,26 +121,93 @@ class BacktestResult:
 
     @property
     def max_drawdown(self) -> float:
-        if self.equity_curve.empty:
+        return _max_drawdown(self.equity_curve)
+
+    @property
+    def benchmark_return(self) -> float:
+        """同じ期間・同じ銘柄を等ウェイトで買い持ちした場合のリターン。"""
+        if len(self.benchmark_curve) < 2:
             return 0.0
-        peak = self.equity_curve.cummax()
-        return float(((peak - self.equity_curve) / peak).max())
+        first = float(self.benchmark_curve.iloc[0])
+        if first <= 0:
+            return 0.0
+        return float(self.benchmark_curve.iloc[-1]) / first - 1.0
+
+    @property
+    def benchmark_max_drawdown(self) -> float:
+        return _max_drawdown(self.benchmark_curve)
+
+    @property
+    def forced_exits(self) -> int:
+        """検証期間の打ち切りによる決済の件数。戦略が決めた決済ではない。"""
+        return sum(1 for t in self.trades if t.exit_reason == "期末")
+
+    @property
+    def top3_profit_share(self) -> float:
+        """総利益のうち、上位 3 取引が占める割合。
+
+        これが高いものは「仕組み」ではなく「数銘柄がたまたま当たった」記録。
+        その数銘柄を抜けば成績は一気に崩れるので、再現性がない。
+        """
+        gains = sorted((t.pnl_jpy for t in self.trades if t.pnl_jpy > 0), reverse=True)
+        total = sum(gains)
+        if total <= 0:
+            return 0.0
+        return sum(gains[:3]) / total
 
     def summary(self) -> str:
         if not self.trades:
             return f"[{self.label}] 取引が 1 件も発生しませんでした（条件が厳しすぎる可能性）"
-        return (
-            f"[{self.label}] {self.start} 〜 {self.end}\n"
-            f"  取引数        : {len(self.trades)}\n"
-            f"  勝率          : {self.win_rate:.1%}\n"
-            f"  総リターン    : {self.total_return:+.1%}\n"
-            f"  最大DD        : {self.max_drawdown:.1%}\n"
-            f"  プロフィットF : {self.profit_factor:.2f}\n"
-            f"  期待値        : {self.expectancy_r:+.2f} R（リスク額で加重）\n"
-            f"  確定損益      : {self.net_pnl_jpy:+,.0f} 円\n"
-            f"  1取引の平均リスク: {self.avg_risk_jpy:,.0f} 円\n"
-            f"  最終資産      : {self.final_equity:,.0f} 円"
-        )
+        forced = self.forced_exits
+        lines = [
+            f"[{self.label}] {self.start} 〜 {self.end}",
+            f"  取引数        : {len(self.trades)}"
+            + (f"（うち期末打ち切り {forced} 件）" if forced else ""),
+            f"  勝率          : {self.win_rate:.1%}",
+            f"  総リターン    : {self.total_return:+.1%}",
+            f"  最大DD        : {self.max_drawdown:.1%}",
+            f"  プロフィットF : {self.profit_factor:.2f}",
+            f"  期待値        : {self.expectancy_r:+.2f} R（リスク額で加重）",
+            f"  確定損益      : {self.net_pnl_jpy:+,.0f} 円（この期間に決済した分）",
+            f"  1取引の平均リスク: {self.avg_risk_jpy:,.0f} 円",
+            f"  上位3取引の利益寄与: {self.top3_profit_share:.0%}",
+            f"  最終資産      : {self.final_equity:,.0f} 円",
+        ]
+        if len(self.benchmark_curve) >= 2:
+            lines.append(
+                f"  同期間の買い持ち: {self.benchmark_return:+.1%}"
+                f"（最大DD {self.benchmark_max_drawdown:.1%}）"
+            )
+        return "\n".join(lines)
+
+
+def _max_drawdown(curve: pd.Series) -> float:
+    if curve.empty:
+        return 0.0
+    peak = curve.cummax()
+    return float(((peak - curve) / peak).max())
+
+
+def _equal_weight_curve(
+    prices: dict[str, pd.DataFrame], all_dates: list[date]
+) -> pd.Series:
+    """対象銘柄を等ウェイトで買い持ちした場合の資産推移。
+
+    銘柄ごとに「この期間で最初に値が付いた日」を 1.0 として正規化し、平均を取る。
+    ⚠️ この比較は買い持ち側に有利であることを承知して読むこと:
+      * 上場廃止銘柄が DB に無いので、生存者バイアスを丸ごと拾っている
+      * 売買コストもスリッページもかからない
+      * 常時 100% 投資で、損切りが無いぶんドローダウンは戦略より深くなる
+    そのため最大ドローダウンも併記して、リターンだけを並べないようにしている。
+    """
+    if not prices or not all_dates:
+        return pd.Series(dtype=float)
+    frame = pd.DataFrame({code: df["close"] for code, df in prices.items()})
+    frame = frame.reindex(all_dates).ffill()
+    base = frame.apply(lambda s: s.dropna().iloc[0] if s.notna().any() else np.nan)
+    normed = frame.div(base).replace([np.inf, -np.inf], np.nan)
+    curve = normed.mean(axis=1, skipna=True)
+    return curve.dropna()
 
 
 def _build_signal_table(
@@ -202,6 +281,21 @@ def _build_signal_table(
     return table, prices, names
 
 
+def _bar_price(df: pd.DataFrame, day: date, column: str) -> float | None:
+    """その日のバーから価格を取り出す。無い・欠損・非正なら None。
+
+    J-Quants は終値だけを必須にして取り込んでいるため、始値が欠損した日が
+    ありうる。そのまま float() すると nan が約定価格になり、損益・期待値・
+    プロフィットファクターが例外も出さずに nan で汚染される。
+    """
+    if day not in df.index:
+        return None
+    value = float(df.loc[day, column])
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
 def _close_position(
     pos: dict,
     *,
@@ -222,6 +316,10 @@ def _close_position(
     commission = (fill + pos["entry_price"]) * pos["quantity"] * fee
     pnl = gross - commission
     risk = (pos["entry_price"] - pos["initial_stop"]) * pos["quantity"]
+    if risk <= 0:
+        # 損切り価格を割って寄り付いた建玉。実際の損切り幅は負になるので、
+        # 建てた時点で失う想定だった金額を分母にする。
+        risk = pos["intended_risk_jpy"]
     return Trade(
         code=pos["code"],
         name=str(names.get(pos["code"], pos["code"])),
@@ -247,9 +345,13 @@ def run_backtest(
     end: date | None = None,
     label: str = "backtest",
     max_symbols: int = 600,
+    prebuilt: tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, str]] | None = None,
 ) -> BacktestResult:
     strategy_names = strategy_names or cfg.screener.strategies
-    table, prices, names = _build_signal_table(cfg, db, strategy_names, max_symbols)
+    table, prices, names = prebuilt or _build_signal_table(
+        cfg, db, strategy_names, max_symbols
+    )
+    table = table.copy()
 
     equity = cfg.risk.equity_jpy
     initial = equity
@@ -285,11 +387,46 @@ def run_backtest(
     fee = cfg.execution.commission_pct
 
     for i, today in enumerate(all_dates):
+        # ---- 0. 前営業日に決めた決済を、当日の始値で執行 ------------------
+        #
+        # ⚠️ 決済価格は「損切り価格ちょうど」ではなく **翌営業日の寄り値**。
+        # 本番の `hinotane mark` は引け後 16:10 に走るので、判定した時点で
+        # 場は終わっている。逆指値注文を出す仕組みは今のところ無い
+        # （OrderRequest に逆指値の欄が無く、立花証券の実装も未完）。
+        # したがって実際に出せる最速の注文は「翌朝の寄り成行」であり、
+        # 損切り価格ちょうどで約定すると仮定するのは、出せない注文を
+        # 前提に成績を計算することになる。ここは必ず本番に合わせる。
+        still_open: list[dict] = []
+        for pos in open_positions:
+            reason = pos.get("pending_exit")
+            if not reason:
+                still_open.append(pos)
+                continue
+            fill_price = _bar_price(prices[pos["code"]], today, "open")
+            if fill_price is None:
+                # 値が付かない日は執行できない。翌営業日に持ち越す。
+                still_open.append(pos)
+                continue
+            trade = _close_position(
+                pos,
+                exit_price=fill_price,
+                exit_date=today,
+                exit_reason=reason,
+                slip=slip,
+                fee=fee,
+                names=names,
+            )
+            equity += trade.pnl_jpy
+            trades.append(trade)
+        open_positions = still_open
+
         # ---- 1. 前営業日のシグナルを、当日の始値でエントリー ---------------
         #
         # 決済判定より先に行う。寄り付きの時点では、その日のうちに
         # どの建玉が決済されるかを知りようがないため、決済で空いた枠を
         # 同じ日のエントリーに使えてしまうのは未来を覗いていることになる。
+        # （0. の決済は前日に決まっていた注文なので、寄りの時点で
+        #   枠が空くことは事前に分かっている。こちらは先読みではない。）
         if i > 0:
             prev = all_dates[i - 1]
             candidates = signals_by_date.get(prev)
@@ -305,21 +442,40 @@ def run_backtest(
                     if code in held_codes or today not in prices[code].index:
                         continue
 
-                    raw_open = float(prices[code].loc[today, "open"])
-                    if not math.isfinite(raw_open) or raw_open <= 0:
+                    raw_open = _bar_price(prices[code], today, "open")
+                    if raw_open is None:
                         continue
                     entry_price = raw_open * (1 + slip)
                     stop = float(sig["stop_price"])
-                    # 寄り付きの時点で既に損切り価格を割っているなら見送る
-                    if stop >= raw_open:
+
+                    # ⚠️ 数量は **シグナル日の終値** を基準に決める。
+                    # 本番（risk.py）は前日終値でシグナルを受け取ってから数量を
+                    # 計算し、翌朝の寄りで成行発注する。バックテストだけ寄り値で
+                    # 数量を決めると、寄り付きのギャップを見てから枚数を調整して
+                    # いることになり、本番では作れない建玉ができる。
+                    intended_risk_per_share = float(sig["ref_price"]) - stop
+                    if intended_risk_per_share <= 0:
                         continue
 
-                    risk_per_share = entry_price - stop
-                    qty = int(math.floor(equity * cfg.risk.risk_per_trade / risk_per_share / lot) * lot)
-                    max_cost = equity * cfg.risk.max_position_pct
+                    # 資金は固定。本番の RiskManager は cfg.risk.equity_jpy を
+                    # 見ており、増えた利益を再投資しない。バックテストだけ複利で
+                    # 回すとリターンが実態より大きく、ドローダウンが小さく出る。
+                    base = cfg.risk.equity_jpy
+                    qty = int(
+                        math.floor(base * cfg.risk.risk_per_trade / intended_risk_per_share / lot)
+                        * lot
+                    )
+                    max_cost = base * cfg.risk.max_position_pct
                     if qty * entry_price > max_cost:
                         qty = int(math.floor(max_cost / entry_price / lot) * lot)
                     if qty < lot:
+                        continue
+
+                    # 建玉の合計が運用資金を超えないこと（本番 risk.py と同じ制約）。
+                    # これが無いと max_position_pct × max_open_positions > 1 の設定で
+                    # 信用取引相当の建て方になり、リターンが水増しされる。
+                    committed = sum(p["entry_price"] * p["quantity"] for p in open_positions)
+                    if committed + qty * entry_price > base:
                         continue
 
                     trail = sig.get("trailing_atr_mult")
@@ -335,47 +491,46 @@ def run_backtest(
                             # トレーリングで stop が動くと、あとから R の意味が
                             # 変わってしまい成績の比較ができなくなる。
                             "initial_stop": stop,
+                            # 建てた時点で「失う」と決めていた金額。ギャップダウンで
+                            # 損切り価格より下に入った場合は実際の損切り幅が負になり
+                            # R 倍率が計算できないので、そのときの分母に使う。
+                            "intended_risk_jpy": intended_risk_per_share * qty,
                             "target": float(sig["target_price"]),
                             "max_holding_days": int(sig["max_holding_days"]),
                             "trailing_atr_mult": None if pd.isna(trail) else trail,
                             "highest": entry_price,
+                            # 「翌営業日の寄りで売る」と決まった決済理由。
+                            # 本番は引け後に判定して翌朝に成行を出すので、
+                            # 判定した瞬間には決済できない。
+                            "pending_exit": None,
                         }
                     )
                     held_codes.add(code)
                     taken += 1
 
-        # ---- 2. 建玉の決済判定（当日の高値・安値で） ----------------------
+        # ---- 2. 当日の値動きで決済を判定する（執行は翌営業日の寄り） --------
         #
         # **当日エントリーした建玉も対象に含める。** 買った初日に損切り価格を
         # 割ることは普通に起きる。ここを翌日以降からにすると、本来なら
         # その日に損切りされた取引が生き延びて、成績が実態より良く出る。
-        still_open: list[dict] = []
         for pos in open_positions:
-            bar = prices[pos["code"]].loc[today] if today in prices[pos["code"]].index else None
-            if bar is None:
-                still_open.append(pos)
+            if pos.get("pending_exit"):
+                # すでに翌営業日の寄りで売ると決まっている。
+                # 決まったあとに損切りを切り上げても意味がない。
                 continue
+            if today not in prices[pos["code"]].index:
+                continue
+            bar = prices[pos["code"]].loc[today]
 
             held = i - date_index[pos["entry_date"]]
-            bar_open = float(bar["open"])
-            exit_price = exit_reason = None
-
             if bar["low"] <= pos["stop"]:
-                # 損切りは「その価格で必ず約定する」とは限らない。
-                # 損切り価格を下回って寄り付いたら、実際の約定は寄り値になる。
-                # ここを stop 固定にすると、ギャップダウンの損失が消えて
-                # 成績が実態より良く出る。
-                exit_price = min(bar_open, pos["stop"])
-                exit_reason = "stop"
+                pos["pending_exit"] = "stop"
             elif bar["high"] >= pos["target"]:
-                # 利確は指値。目標より上で寄り付いたらその寄り値で約定する。
-                exit_price = max(bar_open, pos["target"])
-                exit_reason = "target"
+                pos["pending_exit"] = "target"
             elif held >= pos["max_holding_days"]:
-                exit_price, exit_reason = float(bar["close"]), "timeout"
-
-            if exit_price is None:
-                # 決済しなかった場合だけ、損切りラインを切り上げる。
+                pos["pending_exit"] = "timeout"
+            else:
+                # 決済しない場合だけ、損切りラインを切り上げる。
                 # 判定より先に更新すると、その日の高値を使って
                 # その日の安値を判定することになり未来を覗いてしまう。
                 mult = pos.get("trailing_atr_mult")
@@ -385,21 +540,6 @@ def run_backtest(
                     if atr_now > 0:
                         # 損切りは切り上げるだけ。下げると損失が青天井になる。
                         pos["stop"] = max(pos["stop"], pos["highest"] - mult * atr_now)
-                still_open.append(pos)
-                continue
-
-            trade = _close_position(
-                pos,
-                exit_price=exit_price,
-                exit_date=today,
-                exit_reason=exit_reason,
-                slip=slip,
-                fee=fee,
-                names=names,
-            )
-            equity += trade.pnl_jpy
-            trades.append(trade)
-        open_positions = still_open
 
         # ---- 3. 時価評価 ------------------------------------------------
         unrealized = 0.0
@@ -430,6 +570,9 @@ def run_backtest(
                 pos,
                 exit_price=float(available["close"].iloc[-1]),
                 exit_date=available.index[-1],
+                # 決済理由は必ず「期末」にする。ここは戦略が決めた決済ではなく
+                # 検証を打ち切るための便宜的な手仕舞いなので、損切りや利確と
+                # 同じ扱いで集計に混ぜると成績の読み方を誤らせる。
                 exit_reason="期末",
                 slip=slip,
                 fee=fee,
@@ -452,6 +595,59 @@ def run_backtest(
         final_equity=float(equity_curve.iloc[-1]) if not equity_curve.empty else initial,
         trades=trades,
         equity_curve=equity_curve,
+        benchmark_curve=_equal_weight_curve(prices, all_dates),
+    )
+
+
+
+
+@dataclass
+class WalkForwardReport:
+    """イン／アウトオブサンプル検証の結果と、判定に必要な構造情報。
+
+    判定（judge）が「標本が足りているか」を出力ではなく **設計** から
+    決められるように、ウォームアップ本数・最大保有日数・売買可能だった
+    営業日数を一緒に持ち回る。取引数だけを条件にすると、
+    「たまたま取引が少なかった戦略」が過剰最適化の検査を素通りできてしまう。
+    """
+
+    full: BacktestResult
+    in_sample: BacktestResult
+    out_sample: BacktestResult
+    boundary: date
+    in_window_days: int      # 前半のうち、シグナルを出せた営業日数
+    out_window_days: int
+    warmup_bars: int
+    max_holding_days: int
+
+
+def _slice_result(full: BacktestResult, *, start: date, end: date, label: str) -> BacktestResult:
+    """連続運用の結果を、日付で切り出す。
+
+    ⚠️ 期間を分けて 2 回バックテストを回すのではなく、**1 回だけ通しで回して
+    から切る**。分けて回すと、境界で建玉が強制決済されて「まだ伸びている
+    勝ち馬」がその時点の値で確定損益に化け、前半の成績が水増しされる。
+    さらに後半が「建玉ゼロ・枠が全部空いている」状態から始まるため、
+    実運用では取れなかった建玉まで取れてしまう。
+    """
+    trades = [t for t in full.trades if start <= t.exit_date <= end]
+    curve = full.equity_curve[
+        (full.equity_curve.index >= start) & (full.equity_curve.index <= end)
+    ]
+    bench = full.benchmark_curve[
+        (full.benchmark_curve.index >= start) & (full.benchmark_curve.index <= end)
+    ]
+    initial = float(curve.iloc[0]) if not curve.empty else full.initial_equity
+    final = float(curve.iloc[-1]) if not curve.empty else initial
+    return BacktestResult(
+        label=label,
+        start=start,
+        end=end,
+        initial_equity=initial,
+        final_equity=final,
+        trades=trades,
+        equity_curve=curve,
+        benchmark_curve=bench,
     )
 
 
@@ -462,78 +658,196 @@ def walk_forward(
     strategy_names: list[str] | None = None,
     split: float = 0.6,
     max_symbols: int = 600,
-) -> tuple[BacktestResult, BacktestResult]:
+) -> WalkForwardReport:
     """イン／アウトオブサンプル分割で検証する。
 
     過剰最適化を見抜くための最低限の作法。前半（イン）でだけ成績が良く、
     後半（アウト）で崩れる戦略は、過去に当てはめただけで先には効かない。
+
+    分割は **ウォームアップを除いた売買可能期間** で行う。日足の全期間を
+    単純に 6:4 で割ると、200 日線を使う戦略では前半のほとんどが指標の
+    計算待ちで消え、前半の取引が数件しか出ない。それは戦略の性質ではなく
+    分割器の欠陥で、その数件を基準に後半を測っても何も分からない。
     """
-    dates = db.query("SELECT DISTINCT date FROM daily_quotes ORDER BY date")["date"].tolist()
-    if len(dates) < 200:
+    strategy_names = strategy_names or cfg.screener.strategies
+    prebuilt = _build_signal_table(cfg, db, strategy_names, max_symbols)
+    table, prices, _names = prebuilt
+    if table.empty or not prices:
+        raise ValueError(
+            "シグナルが 1 件も生成されませんでした。"
+            " 先に `hinotane backfill` でデータを取り込んでください。"
+        )
+
+    all_dates = sorted({d for df in prices.values() for d in df.index})
+    if len(all_dates) < 200:
         raise ValueError("検証に十分な日足がありません。先に `hinotane backfill` を実行してください。")
 
-    boundary = dates[int(len(dates) * split)]
-    in_sample = run_backtest(
-        cfg, db, strategy_names=strategy_names, end=boundary,
-        label="イン・サンプル（前半）", max_symbols=max_symbols,
+    strategies = [get_strategy(n) for n in strategy_names]
+    warmup = max(s.warmup_bars for s in strategies)
+    max_hold = max(s.max_holding_days for s in strategies)
+
+    tradable = all_dates[warmup:]
+    if len(tradable) < 40:
+        raise ValueError(
+            f"指標の計算に {warmup} 本必要ですが、日足が {len(all_dates)} 本しかありません。"
+            " 売買できる期間がほとんど残らないため検証できません。"
+        )
+
+    cut = min(max(int(len(tradable) * split), 1), len(tradable) - 1)
+    boundary = tradable[cut]
+
+    full = run_backtest(
+        cfg,
+        db,
+        strategy_names=strategy_names,
+        label="全期間（通しで連続運用）",
+        max_symbols=max_symbols,
+        prebuilt=prebuilt,
     )
-    out_sample = run_backtest(
-        cfg, db, strategy_names=strategy_names, start=boundary,
-        label="アウト・オブ・サンプル（後半）", max_symbols=max_symbols,
+
+    in_sample = _slice_result(
+        full, start=all_dates[0], end=boundary, label="イン・サンプル（前半）"
     )
-    return in_sample, out_sample
+    after = tradable[cut + 1]
+    out_sample = _slice_result(
+        full, start=after, end=all_dates[-1], label="アウト・オブ・サンプル（後半）"
+    )
+
+    return WalkForwardReport(
+        full=full,
+        in_sample=in_sample,
+        out_sample=out_sample,
+        boundary=boundary,
+        in_window_days=cut + 1,
+        out_window_days=len(tradable) - cut - 1,
+        warmup_bars=warmup,
+        max_holding_days=max_hold,
+    )
 
 
-def judge(in_sample: BacktestResult, out_sample: BacktestResult) -> tuple[bool, list[str]]:
-    """イン／アウトオブサンプルの結果から合否を出す。
+PASS = "PASS"
+FAIL = "FAIL"
+UNDETERMINED = "UNDETERMINED"
+
+
+def judge(report: WalkForwardReport) -> tuple[str, list[str]]:
+    """検証結果から合否を出す。返り値は PASS / FAIL / UNDETERMINED。
+
+    **「判定できなかった」を合格側に倒さない。** これが設計の要。
+    bool を返していた頃は、標本不足で検査できなかった項目があっても
+    ✅ が出た。✅ は「実運用に載せてよい」という合図として読まれるので、
+    未検査を ✅ に混ぜるのは、注意書きを添えたところで免罪符にしかならない。
 
     **お金が増えていないものは、何があっても合格にしない。**
-    以前は期待値（R の単純平均）だけで判定していたため、
-    「両期間とも資産が減っているのに合格」という表示が出た。
-    R はリスク額で割った比率なので、取引ごとにリスク額がばらつくと
+    期待値（R）はリスク額で割った比率なので、取引ごとにリスク額がばらつくと
     円の損益と符号が食い違いうる。最終的な判断はお金で行う。
 
     Returns:
-        (合格したか, 表示する行のリスト)
+        (PASS | FAIL | UNDETERMINED, 表示する行のリスト)
     """
+    in_s, out_s = report.in_sample, report.out_sample
     lines: list[str] = []
 
-    if not out_sample.trades:
-        return False, ["⚠️  アウトオブサンプルで取引が発生せず、判断できません。"]
+    if not out_s.trades:
+        return UNDETERMINED, ["⚠️  アウトオブサンプルで取引が発生せず、判断できません。"]
 
-    if len(out_sample.trades) < 30:
-        lines.append(
-            f"⚠️  アウトオブサンプルの取引が {len(out_sample.trades)} 件しかなく、"
-            " 偶然の影響が大きい水準です。数字を強く信じないでください。"
-        )
-
+    # ---------------------------------------------------------- お金の検査
     failures: list[str] = []
-
-    if out_sample.net_pnl_jpy <= 0:
+    if out_s.net_pnl_jpy <= 0:
         failures.append(
             f"アウトオブサンプルで資産が減っています"
-            f"（{out_sample.net_pnl_jpy:+,.0f} 円 / {out_sample.total_return:+.1%}）"
+            f"（{out_s.net_pnl_jpy:+,.0f} 円 / {out_s.total_return:+.1%}）"
         )
-    if out_sample.expectancy_r <= 0:
-        failures.append(f"アウトオブサンプルの期待値がマイナスです（{out_sample.expectancy_r:+.2f} R）")
-    if out_sample.profit_factor <= 1.0:
+    if out_s.expectancy_r <= 0:
+        failures.append(f"アウトオブサンプルの期待値がマイナスです（{out_s.expectancy_r:+.2f} R）")
+    if out_s.profit_factor <= 1.0:
         failures.append(
             f"アウトオブサンプルのプロフィットファクターが 1 以下です"
-            f"（{out_sample.profit_factor:.2f}）＝ 損失が利益を上回っています"
+            f"（{out_s.profit_factor:.2f}）＝ 損失が利益を上回っています"
+        )
+
+    # 買い持ちに、リターンでもドローダウンでも負けているなら、
+    # わざわざ売買する理由がない（買って放っておくほうが良い）。
+    bench_r, bench_dd = out_s.benchmark_return, out_s.benchmark_max_drawdown
+    if len(out_s.benchmark_curve) >= 2:
+        if out_s.total_return < bench_r and out_s.max_drawdown >= bench_dd:
+            failures.append(
+                f"同じ期間の買い持ち（{bench_r:+.1%} / 最大DD {bench_dd:.1%}）に、"
+                f"リターンでもドローダウンでも負けています"
+                f"（{out_s.total_return:+.1%} / 最大DD {out_s.max_drawdown:.1%}）"
+            )
+        elif out_s.total_return < bench_r:
+            lines.append(
+                f"⚠️  リターンでは買い持ち（{bench_r:+.1%}）に負けています"
+                f"（戦略 {out_s.total_return:+.1%}）。"
+                f" 最大DDは戦略 {out_s.max_drawdown:.1%} / 買い持ち {bench_dd:.1%} なので、"
+                " リスクを抑えたぶんの差である可能性はあります。"
+            )
+
+    # 上位数銘柄の当たりで成り立っていないか
+    top3 = out_s.top3_profit_share
+    if top3 > 0.7:
+        failures.append(
+            f"アウトオブサンプルの総利益の {top3:.0%} が上位 3 取引に集中しています。"
+            " 仕組みではなく数銘柄がたまたま当たった記録です"
+        )
+    elif top3 > 0.5:
+        lines.append(
+            f"⚠️  総利益の {top3:.0%} が上位 3 取引に集中しています。"
+            " その数銘柄を抜くと成績はほぼ消えます。"
         )
 
     if failures:
         lines.append("❌ この戦略は実運用に載せないでください。")
         lines.extend(f"   ・{reason}" for reason in failures)
-        if in_sample.net_pnl_jpy > 0:
+        if in_s.net_pnl_jpy > 0:
             lines.append("   ・前半では勝てていたので、過剰最適化の可能性があります。")
-        return False, lines
+        return FAIL, lines
 
-    if in_sample.expectancy_r > 0 and out_sample.expectancy_r < in_sample.expectancy_r * 0.5:
-        lines.append("⚠️  後半で期待値が半分以下に落ちています。過剰最適化の疑いが濃厚です。")
-        return False, lines
+    # ------------------------------------------------ 過剰最適化の検査可否
+    #
+    # ⚠️ 発動条件は「取引数」ではなく **期間の構造** で決める。
+    # 取引数は回してみないと分からない出力なので、それを条件にすると
+    # 「たまたま取引が少なかった」あらゆる戦略が検査を回避できてしまう。
+    # 前半の売買可能期間が最大保有日数の 2 倍を切ると、独立した売買が
+    # 1 巡もせず、期末の打ち切りが全取引に効く。これは実行前に分かる。
+    needed = report.max_holding_days * 2
+    blockers: list[str] = []
+    if report.in_window_days < needed:
+        blockers.append(
+            f"前半の売買可能期間が {report.in_window_days} 営業日しかなく、"
+            f" 最大保有 {report.max_holding_days} 日の売買が 1 巡もしません"
+            f"（{needed} 営業日以上必要）"
+        )
+    if len(in_s.trades) < 30:
+        blockers.append(f"前半の取引が {len(in_s.trades)} 件しかなく、期待値を推定できません")
+
+    if blockers:
+        lines.append("⚠️  判定保留。この戦略は「合格した」のではなく「検証できなかった」状態です。")
+        lines.extend(f"   ・{b}" for b in blockers)
+        lines.append("   ・後半の絶対成績は基準を満たしていますが、")
+        lines.append("     過剰最適化かどうかは **未検査** です。実運用に載せる根拠にはなりません。")
+        lines.append(f"   ・原因はデータの短さです（日足 {report.warmup_bars} 本が指標の計算で消えます）。")
+        lines.append("     履歴を伸ばすか、少額のフォワードテストで取引数を稼いでください。")
+        return UNDETERMINED, lines
+
+    if in_s.expectancy_r > 0 and out_s.expectancy_r < in_s.expectancy_r * 0.5:
+        lines.append("❌ 後半で期待値が半分以下に落ちています。過剰最適化の疑いが濃厚です。")
+        lines.append(f"   ・前半 {in_s.expectancy_r:+.2f} R → 後半 {out_s.expectancy_r:+.2f} R")
+        return FAIL, lines
+
+    if len(out_s.trades) < 30:
+        lines.append(
+            f"⚠️  アウトオブサンプルの取引が {len(out_s.trades)} 件しかなく、"
+            " 偶然の影響が大きい水準です。数字を強く信じないでください。"
+        )
+    if out_s.forced_exits / len(out_s.trades) > 0.25:
+        lines.append(
+            f"⚠️  後半の {out_s.forced_exits} 件は期間の打ち切りによる決済で、"
+            " 戦略が決めた決済ではありません。成績は途中経過に近いものです。"
+        )
 
     lines.append("✅ 前半・後半とも資産が増え、期待値も保たれています。")
     lines.append("   ただしこれは必要条件であって十分条件ではありません。")
     lines.append("   生存者バイアス（上場廃止銘柄を含まない）のぶん、実際はこれより悪くなります。")
-    return True, lines
+    return PASS, lines

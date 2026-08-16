@@ -25,8 +25,9 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
+from itertools import pairwise
 
 import numpy as np
 import pandas as pd
@@ -44,15 +45,23 @@ class Diagnosis:
         return "\n".join(self.lines)
 
 
-def _buy_and_hold_return(prices: dict[str, pd.DataFrame]) -> float:
-    """対象銘柄を等ウェイトで買い持ちした場合のリターン。"""
-    rets = []
-    for df in prices.values():
-        closes = df["close"].dropna()
-        if len(closes) < 2 or closes.iloc[0] <= 0:
-            continue
-        rets.append(closes.iloc[-1] / closes.iloc[0] - 1.0)
-    return float(np.mean(rets)) if rets else 0.0
+def _distinct_opportunities(table: pd.DataFrame, gap_days: int = 5) -> int:
+    """連日続いたシグナルを 1 つの機会としてまとめた件数。
+
+    順張りの条件は一度成立すると数日〜数十日続けて成立する。生の件数を
+    「取りこぼし率」の分母にすると、同じ銘柄の同じ上昇局面が何十回もの
+    機会として数えられ、「99% 取りこぼしている」という誤った診断になる。
+    """
+    if table.empty:
+        return 0
+    count = 0
+    for (_code, _strategy), group in table.groupby(["code", "strategy"]):
+        days = sorted(pd.to_datetime(group["date"]).dt.normalize().unique())
+        count += 1
+        for prev, cur in pairwise(days):
+            if (cur - prev).days > gap_days:
+                count += 1
+    return count
 
 
 def diagnose(
@@ -70,22 +79,45 @@ def diagnose(
         return Diagnosis(["シグナルが 1 件も生成されませんでした。条件が厳しすぎます。"])
 
     result = run_backtest(
-        cfg, db, strategy_names=strategy_names, label="診断", max_symbols=max_symbols
+        cfg,
+        db,
+        strategy_names=strategy_names,
+        label="診断",
+        max_symbols=max_symbols,
+        prebuilt=(table, prices, _names),
     )
 
     # ---------------------------------------------------------- 1. 市況
-    bh = _buy_and_hold_return(prices)
+    bh = result.benchmark_return
+    bh_dd = result.benchmark_max_drawdown
     out.append("=" * 62)
     out.append("【1】この期間の市況（戦略のせいか、相場のせいかを切り分ける）")
     out.append("=" * 62)
-    out.append(f"  対象銘柄を等ウェイトで買い持ちした場合 : {bh:+.1%}")
-    out.append(f"  戦略の総リターン                      : {result.total_return:+.1%}")
+    out.append(f"  等ウェイトで買い持ち : {bh:+.1%}（最大DD {bh_dd:.1%}）")
+    out.append(
+        f"  戦略                 : {result.total_return:+.1%}（最大DD {result.max_drawdown:.1%}）"
+    )
     gap = result.total_return - bh
-    out.append(f"  差（戦略の付加価値）                  : {gap:+.1%}")
+    out.append(f"  リターンの差         : {gap:+.1%}")
+    out.append("")
+    out.append("  ⚠️ この比較は買い持ち側に有利に出来ています。並べて読むときは差し引くこと:")
+    out.append("     ・買い持ちは常時100%投資。戦略は建玉が埋まっていない時間があります")
+    out.append("     ・買い持ちには手数料もスリッページもかかっていません")
+    out.append("     ・上場廃止になった銘柄が DB に無いので、買い持ち側は生存者バイアスを丸取り")
+    out.append("     ・買い持ちには損切りがありません（そのぶん最大DDは深く出ます）")
     if bh < 0 and result.total_return > bh:
         out.append("  → 下げ相場で、買い持ちよりはマシ。戦略が悪いとは言い切れません。")
+    elif result.total_return < bh and result.max_drawdown >= bh_dd:
+        out.append(
+            "  → ⚠️ リターンでもドローダウンでも買い持ちに負けています。"
+            " 売買する意味がありません。"
+        )
     elif bh > 0.05 and result.total_return < 0:
         out.append("  → ⚠️ 相場は上げているのに負けています。戦略が明確に足を引っ張っています。")
+    elif result.total_return < bh:
+        out.append(
+            "  → リターンでは買い持ちに負けていますが、ドローダウンは浅く済んでいます。"
+        )
     elif bh <= 0.05:
         out.append("  → 相場自体がほぼ横ばい。買い戦略には厳しい期間でした。")
 
@@ -123,22 +155,33 @@ def diagnose(
     out.append("=" * 62)
     out.append("【3】決済理由の内訳（損切り・利確の設定が適切か）")
     out.append("=" * 62)
-    reasons = Counter(t.exit_reason for t in result.trades)
-    total = sum(reasons.values()) or 1
-    label = {"stop": "損切り", "target": "利確", "timeout": "時間切れ", "期末": "期末持越"}
-    for reason in ("stop", "target", "timeout", "期末"):
-        n = reasons.get(reason, 0)
-        ts = [t for t in result.trades if t.exit_reason == reason]
+    total = len(result.trades) or 1
+    # ⚠️ exit_reason が "stop" でも、損失とは限らない。
+    # トレーリングストップは利益が乗ると損切りラインを買値の上まで切り上げるので、
+    # 「ストップに当たって利益確定」が正常な決済のかたちになる。
+    # これを一括りに「損切り」と表示すると、うまくいっている戦略に対して
+    # 「損切り幅が狭すぎる」という逆の診断が出る。
+    buckets = [
+        ("stop", lambda t: t.pnl_jpy < 0, "損切り（買値より下）"),
+        ("stop", lambda t: t.pnl_jpy >= 0, "ストップで利確（切り上げ後）"),
+        ("target", lambda t: True, "利確目標"),
+        ("timeout", lambda t: True, "時間切れ"),
+        ("期末", lambda t: True, "期末で打ち切り"),
+    ]
+    for reason, cond, label in buckets:
+        ts = [t for t in result.trades if t.exit_reason == reason and cond(t)]
+        n = len(ts)
         pnl = sum(t.pnl_jpy for t in ts)
-        out.append(f"  {label[reason]:<6} {n:>4} 件 ({n / total:>5.1%})  損益 {pnl:>+11,.0f} 円")
+        out.append(f"  {label:<22} {n:>4} 件 ({n / total:>5.1%})  損益 {pnl:>+11,.0f} 円")
 
-    stop_rate = reasons.get("stop", 0) / total
-    timeout_rate = reasons.get("timeout", 0) / total
+    losing_stops = sum(1 for t in result.trades if t.exit_reason == "stop" and t.pnl_jpy < 0)
+    stop_rate = losing_stops / total
+    timeout_rate = sum(1 for t in result.trades if t.exit_reason == "timeout") / total
     if stop_rate > 0.55:
-        out.append("  → ⚠️ 損切りが過半。損切り幅が狭すぎて、ノイズで振り落とされている疑い。")
+        out.append("  → ⚠️ 損失での損切りが過半。損切り幅が狭すぎて、ノイズで振り落とされている疑い。")
     if timeout_rate > 0.35:
         out.append("  → ⚠️ 時間切れが多い。利確目標が遠すぎるか、そもそも動かない銘柄を掴んでいる。")
-    if reasons.get("期末", 0) / total > 0.25:
+    if result.forced_exits / total > 0.25:
         out.append(
             "  → ⚠️ 期末持越が多い。検証期間が戦略の保有期間に対して短く、"
             "成績が途中経過に近い。データ期間を延ばすまで数字は仮のもの。"
@@ -157,11 +200,17 @@ def diagnose(
     out.append("=" * 62)
     generated = len(table)
     taken = len(result.trades)
-    out.append(f"  生成されたシグナル : {generated:,} 件")
-    out.append(f"  実際に取れた取引   : {taken:,} 件（{taken / max(generated, 1):.1%}）")
+    # ⚠️ 生の件数は「取りこぼし」の分母にならない。
+    # 順張りの条件は一度成立すると連日成立し続けるので、同じ銘柄の同じ上昇局面が
+    # 何十件にも数えられる。連続したシグナルを 1 つの機会としてまとめた数のほうが、
+    # 「本当は何回チャンスがあったのか」に近い。
+    opportunities = _distinct_opportunities(table)
     per_day = table.groupby("date").size()
+    out.append(f"  生成されたシグナル : {generated:,} 件")
+    out.append(f"  独立した機会（連日の重複をまとめた数）: {opportunities:,} 件")
+    out.append(f"  実際に取れた取引   : {taken:,} 件（独立した機会の {taken / max(opportunities, 1):.1%}）")
     out.append(f"  シグナルが出た日   : {len(per_day):,} 日（1日あたり平均 {per_day.mean():.1f} 件）")
-    if taken / max(generated, 1) < 0.2:
+    if taken / max(opportunities, 1) < 0.2:
         out.append(
             f"  → 大半を取りこぼしています。同時保有 {cfg.risk.max_open_positions} 銘柄 /"
             f" 1日 {cfg.risk.max_signals_per_day} 件の枠がボトルネックです。"

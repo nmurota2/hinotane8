@@ -282,21 +282,29 @@ def cmd_backtest(args, cfg, db) -> int:
 
 
 def cmd_walkforward(args, cfg, db) -> int:
-    from .backtest import judge, walk_forward
+    from .backtest import PASS, judge, walk_forward
 
     strategies = args.strategies.split(",") if args.strategies else None
-    in_s, out_s = walk_forward(
+    report = walk_forward(
         cfg, db, strategy_names=strategies, split=args.split, max_symbols=args.max_symbols
     )
-    print(in_s.summary())
+    print(report.full.summary())
     print()
-    print(out_s.summary())
+    print(report.in_sample.summary())
+    print()
+    print(report.out_sample.summary())
+    print(
+        f"\n  ※ 通しで 1 回だけ運用し、決済日で前半／後半に切り分けています。"
+        f"\n    分割点 {report.boundary}（指標の計算に使う {report.warmup_bars} 本を除いた"
+        f"売買可能期間で {args.split:.0%}）"
+        f"\n    売買可能な営業日数: 前半 {report.in_window_days} 日 / 後半 {report.out_window_days} 日"
+    )
 
     print("\n=== 判定 ===")
-    ok, lines = judge(in_s, out_s)
+    verdict, lines = judge(report)
     for line in lines:
         print(line)
-    if not ok:
+    if verdict != PASS:
         print()
         print("   結果をそのまま伝えてください。戦略を作り直します。")
         print("   データと環境はそのまま使えるので、差し替えるのは戦略だけです。")

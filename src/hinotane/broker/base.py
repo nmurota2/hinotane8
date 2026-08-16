@@ -32,6 +32,10 @@ class OrderResult:
     filled_quantity: int
     message: str
     executed_at: date | None = None
+    #: 失敗したが、条件が整えば同じ注文をそのまま再試行してよいか。
+    #: 「まだ翌営業日の株価が来ていない」のような一時的な事情を、
+    #: 「発注を拒否された」と同じ扱いにすると、シグナルが二度と執行されずに死ぬ。
+    retriable: bool = False
 
 
 class BrokerAdapter(ABC):

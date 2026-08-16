@@ -66,12 +66,23 @@ def _row(label: str, value: str, *, color: str = "#333333", bold: bool = False) 
 def _bubble(item: SizedSignal) -> dict[str, Any]:
     s = item.signal
     try:
-        label = get_strategy(s.strategy).label
+        strategy = get_strategy(s.strategy)
+        label, has_target = strategy.label, strategy.has_profit_target
     except KeyError:
-        label = s.strategy
+        label, has_target = s.strategy, True
 
     loss_pct = (s.stop_price / s.entry_price - 1) * 100
     gain_pct = (s.target_price / s.entry_price - 1) * 100
+
+    # トレーリングで降りる戦略は利確目標を使わない。R 倍率の計算のために
+    # 遠い値を入れてあるだけなので、それを目標として見せてはいけない。
+    if has_target:
+        target_rows = [
+            _row("利確目標", f"{s.target_price:,.0f} 円 ({gain_pct:+.1f}%)", color="#1e8449"),
+            _row("リワード/リスク", f"{s.reward_risk:.1f} 倍"),
+        ]
+    else:
+        target_rows = [_row("利確", "目標なし。トレーリングストップで撤退", color="#1e8449")]
 
     reason_lines = [
         {
@@ -124,8 +135,7 @@ def _bubble(item: SizedSignal) -> dict[str, Any]:
                 {"type": "separator", "margin": "md"},
                 _row("想定エントリー", f"{s.entry_price:,.0f} 円", bold=True),
                 _row("損切り", f"{s.stop_price:,.0f} 円 ({loss_pct:+.1f}%)", color="#c0392b"),
-                _row("利確目標", f"{s.target_price:,.0f} 円 ({gain_pct:+.1f}%)", color="#1e8449"),
-                _row("リワード/リスク", f"{s.reward_risk:.1f} 倍"),
+                *target_rows,
                 {"type": "separator", "margin": "md"},
                 _row("提案数量", f"{item.quantity:,} 株"),
                 _row("必要資金", f"{item.cost_jpy:,.0f} 円"),
