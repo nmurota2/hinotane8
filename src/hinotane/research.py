@@ -430,9 +430,12 @@ def run_research(
         out.append("  → ピーク含み益と実現の差が、トレーリングが返上した分です。")
         out.append("     幅を広げると保有日数が伸び、取引数が減り、コストが下がるはずです。")
 
-    out.append("")
-    out.append("【2】損切りは得か損か")
-    nostop, fixed = gap("③ 損切りを外す"), gap("④ トレーリングを外す")
+    if battery == "1":
+        out.append("")
+        out.append("【2】損切りは得か損か")
+        nostop, fixed = gap("③ 損切りを外す"), gap("④ トレーリングを外す")
+    else:
+        nostop = fixed = None
     if nostop is not None:
         out.append(f"  損切りを外すと {nostop:+.2f}R の変化")
         out.append(
@@ -448,16 +451,18 @@ def run_research(
             else "  → トレーリングは効いていません。固定損切りと変わりません。"
         )
 
-    out.append("")
-    out.append("【3】エントリーの場面は適切か")
-    for name in ("⑤ 地合いフィルタ", "⑥ 高値更新を待たない"):
-        d = gap(name)
-        if d is not None:
-            out.append(f"  {name}: {d:+.2f}R")
+    if battery == "1":
+        out.append("")
+        out.append("【3】エントリーの場面は適切か")
+        for name in ("⑤ 地合いフィルタ", "⑥ 高値更新を待たない"):
+            d = gap(name)
+            if d is not None:
+                out.append(f"  {name}: {d:+.2f}R")
 
-    out.append("")
-    out.append("【4】集中しすぎていないか")
-    for name in ("⑦ 同時保有を5→15銘柄", "⑧ 同時保有を5→30銘柄"):
+    if battery == "1":
+        out.append("")
+        out.append("【4】集中しすぎていないか")
+    for name in ("⑦ 同時保有を5→15銘柄", "⑧ 同時保有を5→30銘柄") if battery == "1" else ():
         er, d = by_name.get(name), gap(name)
         if er is None or d is None:
             continue
@@ -492,7 +497,9 @@ def run_research(
             f" / リターン {er.result.total_return:+.1%}{note}{degenerate}"
         )
     spread = [by_name.get(n) for n in ("⑦ 同時保有を5→15銘柄", "⑧ 同時保有を5→30銘柄")]
-    if any(er is not None and er.result.trades for er in spread):
+    if battery != "1":
+        pass
+    elif any(er is not None and er.result.trades for er in spread):
         out.append("  → 銘柄数を増やすほど良くなるなら、それは「選別が効いていない」証拠です。")
         out.append("     選ばずに広く持つほうが良い＝順位づけに情報が無い、ということ。")
     else:
@@ -525,7 +532,7 @@ def run_research(
         er for er in results if er.ci[0] > 0 and er.result.total_return > 0
     ]
     if not positive:
-        out.append(f"  {k} 個すべてで、期待値の {confidence:.0%} 信頼区間がゼロをまたぎました。")
+        out.append(f"  {k} 個すべてで、期待値の {confidence:.2%} 信頼区間がゼロをまたぎました。")
         out.append("  補正前の 95% で見ても足りないなら、この方向に優位性はありません。")
         out.append("  対照群との差を見て、**どの要素を作り直すか** を決めてください。")
     else:

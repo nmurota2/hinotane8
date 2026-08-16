@@ -841,3 +841,46 @@ def test_factor_scan_finds_nothing_in_a_driftless_market(noise_cfg, db):
         "上がりも下がりもしない市場で、順位づけに情報があると報告している"
     )
     assert "封印中" in text
+
+
+def test_trend2_changes_exactly_one_thing_from_trend():
+    """trend2 が trend から 1 か所しか変えていないこと。
+
+    事前登録（docs/06_preregistration.md）で「変更は 1 か所だけ」と宣言している。
+    あとから静かに他の値も変えると、後半のデータで測っているものが
+    宣言したものと別物になる。
+    """
+    from hinotane.strategies.base import get_strategy
+
+    a, b = get_strategy("trend"), get_strategy("trend2")
+    differences = {
+        attr
+        for attr in (
+            "atr_stop_mult", "trailing_atr_mult", "max_holding_days",
+            "warmup_bars", "exit_trigger", "use_stop_exit",
+            "has_profit_target", "max_daily_jump",
+        )
+        if getattr(a, attr, None) != getattr(b, attr, None)
+    }
+    assert differences == {"trailing_atr_mult"}, (
+        f"宣言と違う箇所が変わっています: {differences}"
+    )
+    assert b.trailing_atr_mult == 7.0
+    assert b.atr_stop_mult == 3.0, "数量計算の基準は動かさない約束"
+
+
+def test_trend2_entry_conditions_are_identical_to_trend(noise_cfg, db):
+    """エントリー条件が完全に同じであること（変更は決済側だけ）。"""
+    import pandas as pd
+
+    from hinotane.indicators import enrich
+    from hinotane.strategies.base import get_strategy
+
+    _rising_market(db)
+    enriched = enrich(db.bars("30000", limit=400))
+    a = get_strategy("trend").evaluate(enriched)
+    b = get_strategy("trend2").evaluate(enriched)
+
+    pd.testing.assert_series_equal(a["entry"], b["entry"], check_names=False)
+    pd.testing.assert_series_equal(a["stop_price"], b["stop_price"], check_names=False)
+    pd.testing.assert_series_equal(a["score"], b["score"], check_names=False)

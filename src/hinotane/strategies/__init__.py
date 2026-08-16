@@ -27,6 +27,7 @@ from .research import (
 )
 from .reversal import ReversalStrategy
 from .trend import TrendStrategy
+from .trend2 import Trend2Strategy
 
 __all__ = [
     "BreakoutStrategy",
@@ -34,6 +35,7 @@ __all__ = [
     "ReversalStrategy",
     "Strategy",
     "StrategySignal",
+    "Trend2Strategy",
     "TrendCloseTrigger",
     "TrendFixedStopStrategy",
     "TrendLooseEntryStrategy",
