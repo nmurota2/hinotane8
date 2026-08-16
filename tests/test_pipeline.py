@@ -312,3 +312,48 @@ def test_forward_status_always_shows_the_benchmark(cfg, seeded_db):
     assert "同期間の買い持ち" in text
     assert "差（戦略の付加価値）" in text
     assert "まだ判断できません" in text, "取引ゼロで判断を出してはいけない"
+
+
+def test_universe_report_exposes_what_is_excluded(cfg, seeded_db):
+    """検証対象から何を落としているかを、数字で出すこと。
+
+    「日足のテクニカルでは勝てない」と結論したが、実際に見ていたのは
+    4,487 銘柄のうち 600 銘柄で、グロース市場は設定から最初に外れていた。
+    どこで何件落ちているかを見ないまま結論すると、範囲を誤認する。
+    """
+    from hinotane.universe import report
+
+    text = report(cfg, seeded_db, max_symbols=5)
+    assert "生存者バイアス" in text
+    assert "市場区分ごとの銘柄数" in text
+    assert "絞り込みの各段階" in text
+    assert "1単元" in text
+    # 結論の前に、必ず限界を書くこと
+    assert "上場廃止銘柄が入っていないと" in text
+
+
+def test_universe_report_counts_symbols_missing_from_the_listed_table(cfg, seeded_db):
+    """株価はあるのに上場一覧に無い銘柄を、見逃さず数えること。
+
+    daily_quotes は日付単位で「その日に取引があった全銘柄」を取り込むが、
+    listed は取得時点の一覧なので、途中で上場廃止になった銘柄は入らない。
+    検証は両者を JOIN するため、上場廃止銘柄は黙って対象外になる。
+    成績を実態より良く見せる方向に効くので、件数を必ず表に出す。
+    """
+    import pandas as pd
+
+    from hinotane.universe import report
+
+    dates = seeded_db.query("SELECT DISTINCT date FROM daily_quotes ORDER BY date")["date"]
+    # 上場一覧に無い銘柄の株価だけを入れる（＝上場廃止銘柄の再現）
+    seeded_db.upsert_quotes(
+        pd.DataFrame({
+            "code": ["99999"] * len(dates),
+            "date": dates,
+            "open": 1000.0, "high": 1010.0, "low": 990.0, "close": 1000.0,
+            "volume": 100000.0, "turnover_value": 1e8,
+        })
+    )
+    text = report(cfg, seeded_db, max_symbols=5)
+    assert "一覧に無い銘柄         : 1" in text, text[:600]
+    assert "黙って外れています" in text

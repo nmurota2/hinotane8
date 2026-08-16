@@ -18,6 +18,7 @@
     hinotane factors                  候補の順位づけに情報があるかを直接測る
     hinotane forward-start            紙トレードの記録を開始（開始日を固定）
     hinotane forward                  紙トレードの経過を買い持ちと並べて表示
+    hinotane universe                 検証対象から何を落としているかを表示
     hinotane serve                    LINE Webhook サーバーを起動
 """
 
@@ -401,6 +402,14 @@ def cmd_forward(args, cfg, db) -> int:
     return 0
 
 
+def cmd_universe(args, cfg, db) -> int:
+    """検証対象から何を落としているのかを数字で出す。"""
+    from .universe import report
+
+    print(report(cfg, db, max_symbols=args.max_symbols))
+    return 0
+
+
 def cmd_diagnose(args, cfg, db) -> int:
     """負けている戦略の、どこが悪いのかを特定する。"""
     from .diagnose import diagnose
@@ -486,6 +495,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     fw = sub.add_parser("forward", help="紙トレードの経過を表示")
     fw.set_defaults(func=cmd_forward)
+
+    un = sub.add_parser("universe", help="検証対象から何を落としているかを表示")
+    un.add_argument("--max-symbols", type=int, default=600)
+    un.set_defaults(func=cmd_universe)
 
     dg = sub.add_parser("diagnose", help="戦略のどこが悪いのかを診断")
     dg.add_argument("--strategies", help="カンマ区切り。省略時は設定値")
