@@ -44,6 +44,7 @@ class Trade:
     exit_price: float
     quantity: int
     pnl_jpy: float
+    risk_jpy: float            # この取引で失う想定だった金額（損切り幅 × 数量）
     r_multiple: float          # 損切り幅の何倍取れたか
     exit_reason: str
 
@@ -82,10 +83,29 @@ class BacktestResult:
 
     @property
     def expectancy_r(self) -> float:
-        """1 トレードあたりの期待値（R 倍単位）。ここがプラスでなければ話にならない。"""
+        """リスク 1 単位あたりの損益（R 倍単位）。
+
+        **単純平均ではなくリスク額で加重する。** 単元株の丸めや 1 銘柄あたりの
+        投資上限により、1 取引あたりのリスク額は実際には数百円〜1万円とばらつく。
+        単純平均だと「R はプラスなのに円では負けている」という矛盾が起きうる
+        （実際に起きた）。加重すれば符号は必ず円の損益と一致する。
+        """
+        total_risk = sum(t.risk_jpy for t in self.trades)
+        if total_risk <= 0:
+            return 0.0
+        return sum(t.pnl_jpy for t in self.trades) / total_risk
+
+    @property
+    def net_pnl_jpy(self) -> float:
+        return sum(t.pnl_jpy for t in self.trades)
+
+    @property
+    def avg_risk_jpy(self) -> float:
+        """1 取引あたりの実際のリスク額。設定値より大幅に小さければ
+        1 銘柄あたりの投資上限に頭を抑えられている。"""
         if not self.trades:
             return 0.0
-        return float(np.mean([t.r_multiple for t in self.trades]))
+        return float(np.mean([t.risk_jpy for t in self.trades]))
 
     @property
     def max_drawdown(self) -> float:
@@ -104,7 +124,9 @@ class BacktestResult:
             f"  総リターン    : {self.total_return:+.1%}\n"
             f"  最大DD        : {self.max_drawdown:.1%}\n"
             f"  プロフィットF : {self.profit_factor:.2f}\n"
-            f"  期待値        : {self.expectancy_r:+.2f} R\n"
+            f"  期待値        : {self.expectancy_r:+.2f} R（リスク額で加重）\n"
+            f"  確定損益      : {self.net_pnl_jpy:+,.0f} 円\n"
+            f"  1取引の平均リスク: {self.avg_risk_jpy:,.0f} 円\n"
             f"  最終資産      : {self.final_equity:,.0f} 円"
         )
 
@@ -328,6 +350,7 @@ def run_backtest(
                     exit_price=fill,
                     quantity=pos["quantity"],
                     pnl_jpy=pnl,
+                    risk_jpy=risk,
                     r_multiple=pnl / risk if risk > 0 else 0.0,
                     exit_reason=exit_reason,
                 )
@@ -381,3 +404,58 @@ def walk_forward(
         label="アウト・オブ・サンプル（後半）", max_symbols=max_symbols,
     )
     return in_sample, out_sample
+
+
+def judge(in_sample: BacktestResult, out_sample: BacktestResult) -> tuple[bool, list[str]]:
+    """イン／アウトオブサンプルの結果から合否を出す。
+
+    **お金が増えていないものは、何があっても合格にしない。**
+    以前は期待値（R の単純平均）だけで判定していたため、
+    「両期間とも資産が減っているのに合格」という表示が出た。
+    R はリスク額で割った比率なので、取引ごとにリスク額がばらつくと
+    円の損益と符号が食い違いうる。最終的な判断はお金で行う。
+
+    Returns:
+        (合格したか, 表示する行のリスト)
+    """
+    lines: list[str] = []
+
+    if not out_sample.trades:
+        return False, ["⚠️  アウトオブサンプルで取引が発生せず、判断できません。"]
+
+    if len(out_sample.trades) < 30:
+        lines.append(
+            f"⚠️  アウトオブサンプルの取引が {len(out_sample.trades)} 件しかなく、"
+            " 偶然の影響が大きい水準です。数字を強く信じないでください。"
+        )
+
+    failures: list[str] = []
+
+    if out_sample.net_pnl_jpy <= 0:
+        failures.append(
+            f"アウトオブサンプルで資産が減っています"
+            f"（{out_sample.net_pnl_jpy:+,.0f} 円 / {out_sample.total_return:+.1%}）"
+        )
+    if out_sample.expectancy_r <= 0:
+        failures.append(f"アウトオブサンプルの期待値がマイナスです（{out_sample.expectancy_r:+.2f} R）")
+    if out_sample.profit_factor <= 1.0:
+        failures.append(
+            f"アウトオブサンプルのプロフィットファクターが 1 以下です"
+            f"（{out_sample.profit_factor:.2f}）＝ 損失が利益を上回っています"
+        )
+
+    if failures:
+        lines.append("❌ この戦略は実運用に載せないでください。")
+        lines.extend(f"   ・{reason}" for reason in failures)
+        if in_sample.net_pnl_jpy > 0:
+            lines.append("   ・前半では勝てていたので、過剰最適化の可能性があります。")
+        return False, lines
+
+    if in_sample.expectancy_r > 0 and out_sample.expectancy_r < in_sample.expectancy_r * 0.5:
+        lines.append("⚠️  後半で期待値が半分以下に落ちています。過剰最適化の疑いが濃厚です。")
+        return False, lines
+
+    lines.append("✅ 前半・後半とも資産が増え、期待値も保たれています。")
+    lines.append("   ただしこれは必要条件であって十分条件ではありません。")
+    lines.append("   生存者バイアス（上場廃止銘柄を含まない）のぶん、実際はこれより悪くなります。")
+    return True, lines

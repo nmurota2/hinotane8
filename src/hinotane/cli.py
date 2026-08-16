@@ -281,7 +281,7 @@ def cmd_backtest(args, cfg, db) -> int:
 
 
 def cmd_walkforward(args, cfg, db) -> int:
-    from .backtest import walk_forward
+    from .backtest import judge, walk_forward
 
     strategies = args.strategies.split(",") if args.strategies else None
     in_s, out_s = walk_forward(
@@ -292,15 +292,13 @@ def cmd_walkforward(args, cfg, db) -> int:
     print(out_s.summary())
 
     print("\n=== 判定 ===")
-    if not out_s.trades:
-        print("⚠️  アウトオブサンプルで取引が発生せず、判断できません。")
-        return 0
-    if out_s.expectancy_r <= 0:
-        print("❌ アウトオブサンプルの期待値がマイナスです。この戦略は実運用に載せないでください。")
-    elif in_s.expectancy_r > 0 and out_s.expectancy_r < in_s.expectancy_r * 0.5:
-        print("⚠️  後半で期待値が半分以下に落ちています。過剰最適化の疑いが濃厚です。")
-    else:
-        print("✅ 前半・後半で期待値が保たれています。ただしこれは必要条件であって十分条件ではありません。")
+    ok, lines = judge(in_s, out_s)
+    for line in lines:
+        print(line)
+    if not ok:
+        print()
+        print("   結果をそのまま伝えてください。戦略を作り直します。")
+        print("   データと環境はそのまま使えるので、差し替えるのは戦略だけです。")
     return 0
 
 

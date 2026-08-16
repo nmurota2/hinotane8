@@ -166,3 +166,95 @@ def test_symbol_selection_uses_only_information_available_at_the_start(noise_cfg
         "検証期間の後半に流動性が上がった銘柄を選んでいる。"
         " 開始時点で知り得ない情報で銘柄を選別している。"
     )
+
+
+# ------------------------------------------------------------ 判定ロジック
+
+
+def _result(*, net_pnl: float, expectancy: float, pf: float, n_trades: int = 50):
+    """判定に必要な指標だけを持つスタブ。"""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        trades=list(range(n_trades)),
+        net_pnl_jpy=net_pnl,
+        expectancy_r=expectancy,
+        profit_factor=pf,
+        total_return=net_pnl / 1_000_000,
+    )
+
+
+def test_losing_strategy_is_never_approved():
+    """お金が減っているものを合格にしないこと。
+
+    以前は期待値（R の単純平均）だけを見ていたため、
+    「両期間とも資産が減っているのに ✅」という表示が出た。
+    R はリスク額で割った比率なので、取引ごとにリスク額がばらつくと
+    円の損益と符号が食い違いうる。
+    """
+    from hinotane.backtest import judge
+
+    ok, lines = judge(
+        _result(net_pnl=-13_000, expectancy=0.07, pf=0.99),
+        _result(net_pnl=-53_000, expectancy=0.11, pf=0.84),
+    )
+    assert not ok, f"資産が減っているのに合格になった: {lines}"
+    text = "\n".join(lines)
+    assert "❌" in text
+    assert "資産が減っています" in text
+
+
+def test_profit_factor_below_one_is_rejected():
+    from hinotane.backtest import judge
+
+    ok, lines = judge(
+        _result(net_pnl=100_000, expectancy=0.3, pf=1.5),
+        _result(net_pnl=1_000, expectancy=0.01, pf=0.9),
+    )
+    assert not ok
+    assert any("プロフィットファクター" in line for line in lines)
+
+
+def test_overfitting_is_flagged():
+    """前半だけ強く後半で崩れる戦略は落とすこと。"""
+    from hinotane.backtest import judge
+
+    ok, lines = judge(
+        _result(net_pnl=300_000, expectancy=0.80, pf=2.5),
+        _result(net_pnl=5_000, expectancy=0.05, pf=1.05),
+    )
+    assert not ok
+    assert any("過剰最適化" in line for line in lines)
+
+
+def test_genuinely_profitable_strategy_passes():
+    from hinotane.backtest import judge
+
+    ok, lines = judge(
+        _result(net_pnl=180_000, expectancy=0.35, pf=1.8),
+        _result(net_pnl=150_000, expectancy=0.31, pf=1.7),
+    )
+    assert ok, lines
+    text = "\n".join(lines)
+    assert "✅" in text
+    assert "生存者バイアス" in text, "合格時こそ限界を明示すべき"
+
+
+def test_too_few_trades_is_warned():
+    from hinotane.backtest import judge
+
+    _, lines = judge(
+        _result(net_pnl=180_000, expectancy=0.35, pf=1.8),
+        _result(net_pnl=150_000, expectancy=0.31, pf=1.7, n_trades=12),
+    )
+    assert any("偶然の影響" in line for line in lines)
+
+
+def test_expectancy_sign_always_matches_the_money(noise_cfg, db):
+    """期待値の符号が、実際の円の損益と必ず一致すること。"""
+    _driftless_market(db)
+    r = run_backtest(noise_cfg, db, label="符号の一致", max_symbols=60)
+    assert r.trades
+    assert (r.expectancy_r > 0) == (r.net_pnl_jpy > 0), (
+        f"期待値 {r.expectancy_r:+.3f}R と損益 {r.net_pnl_jpy:+,.0f}円 の符号が食い違っている"
+    )
