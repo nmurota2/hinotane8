@@ -85,7 +85,7 @@ else
 fi
 
 VENV_PY="$ROOT/.venv/bin/python"
-HINOTANE="$ROOT/.venv/bin/hinotane"
+# 起動は hinotane.sh 経由にする。pip の登録が壊れていても動くため。
 
 # ------------------------------------------------------- 3. パッケージ
 step "3/5 必要なパッケージを入れます（初回は数分かかります）"
@@ -203,7 +203,7 @@ step "5/5 設定を確認します"
 say ""
 
 set +e
-"$HINOTANE" doctor
+"$ROOT/hinotane.sh" doctor
 DOCTOR_STATUS=$?
 set -e
 
@@ -215,20 +215,20 @@ if [ $DOCTOR_STATUS -eq 0 ]; then
     say "${BOLD}次にやること${RESET}"
     say ""
     say "  1) 過去データを取り込む（数十分かかります。放っておいてOK）"
-    say "     ${BOLD}.venv/bin/hinotane backfill --years 2${RESET}"
+    say "     ${BOLD}./hinotane.sh backfill --years 2${RESET}"
     say ""
     say "  2) スクリーニングを試す（LINE には送りません）"
-    say "     ${BOLD}.venv/bin/hinotane screen --dry-run${RESET}"
+    say "     ${BOLD}./hinotane.sh screen --dry-run${RESET}"
     say ""
     say "  3) バックテストで戦略を検証する"
-    say "     ${BOLD}.venv/bin/hinotane walkforward${RESET}"
+    say "     ${BOLD}./hinotane.sh walkforward${RESET}"
     say ""
     say "  LINE 通知を使うときは docs/03_setup_guide.md の「2. LINE」へ。"
 else
     warn "設定に問題があります。${BOLD}上に出ている原因の候補${RESET}${YELLOW}を確認してください。${RESET}"
     say ""
     say "  直したら、もう一度この確認だけ実行できます:"
-    say "     ${BOLD}.venv/bin/hinotane doctor${RESET}"
+    say "     ${BOLD}./hinotane.sh doctor${RESET}"
     say ""
     say "  解決しなければ、上の出力をそのまま伝えてください。"
 fi

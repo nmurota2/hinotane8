@@ -97,3 +97,25 @@ def test_doubled_secret_detection(value, expected):
     from hinotane.cli import _looks_doubled
 
     assert _looks_doubled(value) == expected
+
+
+def test_package_is_runnable_as_module():
+    """`python -m hinotane` の経路が壊れていないこと。
+
+    pip のインストール登録が壊れても動く逃げ道なので、
+    ここが折れると復旧手段がなくなる。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-m", "hinotane", "--help"],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(root / "src")},
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "doctor" in result.stdout

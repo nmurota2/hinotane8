@@ -42,7 +42,7 @@ step "2/2 設定を確認します"
 printf "\n"
 
 set +e
-.venv/bin/hinotane doctor
+"$(dirname "$0")/../hinotane.sh" doctor
 DOCTOR_STATUS=$?
 set -e
 
@@ -50,9 +50,9 @@ printf "\n%s──────────────────────�
 if [ $DOCTOR_STATUS -eq 0 ]; then
     ok "最新版で正常に動いています"
     printf "\n  そのまま次の作業に進めます。よく使うコマンド:\n\n"
-    printf "    %s.venv/bin/hinotane backfill --years 2%s   過去データの取り込み\n" "$BOLD" "$RESET"
-    printf "    %s.venv/bin/hinotane screen --dry-run%s     候補を画面に表示\n" "$BOLD" "$RESET"
-    printf "    %s.venv/bin/hinotane walkforward%s          戦略の検証\n" "$BOLD" "$RESET"
+    printf "    %s./hinotane.sh backfill --years 2%s   過去データの取り込み\n" "$BOLD" "$RESET"
+    printf "    %s./hinotane.sh screen --dry-run%s     候補を画面に表示\n" "$BOLD" "$RESET"
+    printf "    %s./hinotane.sh walkforward%s          戦略の検証\n" "$BOLD" "$RESET"
 else
     warn "設定に問題があります。上に出ている原因の候補を確認してください。"
     printf "\n  解決しなければ、上の出力をそのまま伝えてください。\n"

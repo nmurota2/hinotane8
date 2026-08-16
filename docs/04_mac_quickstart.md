@@ -124,15 +124,27 @@ bash scripts/setup.sh
 
 ---
 
+## 📌 コマンドの実行方法（ここだけ覚えてください）
+
+このリポジトリ直下で、**先頭に `./hinotane.sh` を付けて**実行します。
+
+```bash
+./hinotane.sh doctor
+```
+
+> `source .venv/bin/activate` のような準備は要りません。
+> **ターミナルを開き直しても、そのまま使えます。**
+>
+> このスクリプトはソースの場所を直接指定して起動するので、
+> `ModuleNotFoundError` や `command not found` が起きません。
+
+---
+
 ## Step 4. 過去データを取り込む（20〜40分・放置でOK）
 
 ```bash
-source .venv/bin/activate
-hinotane backfill --years 2
+./hinotane.sh backfill --years 2
 ```
-
-> `source .venv/bin/activate` は**ターミナルを開くたびに毎回必要**です。
-> 忘れると `hinotane: command not found` と出ます。
 
 過去2年ぶんの全銘柄の株価を取り込みます。**時間がかかるので、コーヒーでも飲んでいてください。**
 途中で止めても、次に実行すれば続きから進みます。
@@ -144,7 +156,7 @@ hinotane backfill --years 2
 ## Step 5. スクリーニングを試す（LINEにはまだ送りません）
 
 ```bash
-hinotane screen --dry-run
+./hinotane.sh screen --dry-run
 ```
 
 画面に候補銘柄が並べば成功です。
@@ -172,7 +184,7 @@ hinotane screen --dry-run
 **ここが一番大事です。** 同梱の戦略は「動く土台」であって、儲かることが検証済みのものではありません。
 
 ```bash
-hinotane walkforward
+./hinotane.sh walkforward
 ```
 
 データを前半・後半に割って、**「過去に当てはめただけの戦略」ではないか**を判定します。
@@ -224,8 +236,8 @@ bash scripts/update.sh
 
 | 症状 | 対処 |
 |---|---|
-| `ModuleNotFoundError: No module named 'hinotane'` | **Pull したあとに再インストールしていません。** `bash scripts/update.sh` を実行してください |
-| `hinotane: command not found` | `source .venv/bin/activate` を忘れています。ターミナルを開き直すたびに必要です |
+| `ModuleNotFoundError: No module named 'hinotane'` | **`./hinotane.sh` を付けて実行してください。**（例: `./hinotane.sh doctor`）これで解決しなければ `bash scripts/update.sh` |
+| `hinotane: command not found` | 同上。`./hinotane.sh` を付けて実行してください |
 | `bash: scripts/setup.sh: No such file` | フォルダの移動（`cd`）ができていません。`ls` で `scripts` が見えるか確認 |
 | `python3 -V` が 3.9 のまま | Python インストール後にターミナルを開き直していません |
 | APIキーを打っても画面に出ない | **仕様です。** そのまま `Enter` を押してください |

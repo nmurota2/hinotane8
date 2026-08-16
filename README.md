@@ -438,16 +438,29 @@ J-Quants が返すカラム名が想定と違っています。エラーメッ�
 
 ---
 
-## 更新
+## コマンドの実行方法
 
-コードを取り込んだあとは、必ず再インストールしてください。
+リポジトリ直下で `./hinotane.sh` を付けて実行します。
+
+```bash
+./hinotane.sh doctor
+./hinotane.sh backfill --years 2
+./hinotane.sh screen --dry-run
+```
+
+仮想環境の有効化は不要です。ソースの場所を直接指定して起動するため、
+pip のインストール登録が壊れていても動きます。
+
+`hinotane doctor` のように直接呼ぶ形（`pip install -e .` に依存）でも動きますが、
+コードを更新した直後などに `ModuleNotFoundError` になることがあります。
+
+## 更新
 
 ```bash
 git pull                    # または GitHub Desktop の Fetch → Pull
 bash scripts/update.sh      # 再インストール＋設定診断
 ```
 
-これを飛ばすと `ModuleNotFoundError: No module named 'hinotane'` になります。
 `.env` は触らないので設定は残ります。
 
 ## 開発
