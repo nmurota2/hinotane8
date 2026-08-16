@@ -103,6 +103,16 @@ CREATE TABLE IF NOT EXISTS runs (
     detail          VARCHAR
 );
 
+-- 紙トレードの開始点。ここを固定しておかないと「いつから数えた成績か」が
+-- 後から動いてしまい、比較相手（買い持ち）と土俵が揃わなくなる。
+CREATE TABLE IF NOT EXISTS forward_test (
+    id              VARCHAR PRIMARY KEY,       -- 常に 'default'（1 件だけ）
+    started_on      DATE NOT NULL,             -- 記録を始めた日
+    start_equity    DOUBLE NOT NULL,           -- 開始時の運用資金
+    strategies      VARCHAR,                   -- 記録対象の戦略
+    note            VARCHAR
+);
+
 CREATE INDEX IF NOT EXISTS idx_quotes_date ON daily_quotes(date);
 CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status);
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);

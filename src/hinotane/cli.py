@@ -16,6 +16,8 @@
     hinotane diagnose                 負けている原因を特定
     hinotane research                 対照群と比べて敗因を実験で特定
     hinotane factors                  候補の順位づけに情報があるかを直接測る
+    hinotane forward-start            紙トレードの記録を開始（開始日を固定）
+    hinotane forward                  紙トレードの経過を買い持ちと並べて表示
     hinotane serve                    LINE Webhook サーバーを起動
 """
 
@@ -382,6 +384,23 @@ def cmd_factors(args, cfg, db) -> int:
     return 0
 
 
+def cmd_forward_start(args, cfg, db) -> int:
+    """紙トレードの記録を開始する。開始日は後から動かせない。"""
+    from .forward import start
+
+    strategies = args.strategies or ",".join(cfg.screener.strategies)
+    print(start(cfg, db, strategies=strategies, note=args.note or ""))
+    return 0
+
+
+def cmd_forward(args, cfg, db) -> int:
+    """紙トレードの経過を、同じ期間の買い持ちと並べて表示する。"""
+    from .forward import status
+
+    print(status(cfg, db))
+    return 0
+
+
 def cmd_diagnose(args, cfg, db) -> int:
     """負けている戦略の、どこが悪いのかを特定する。"""
     from .diagnose import diagnose
@@ -459,6 +478,14 @@ def build_parser() -> argparse.ArgumentParser:
     fa.add_argument("--max-symbols", type=int, default=600)
     fa.add_argument("--split", type=float, default=0.6)
     fa.set_defaults(func=cmd_factors)
+
+    fs = sub.add_parser("forward-start", help="紙トレードの記録を開始")
+    fs.add_argument("--strategies", help="カンマ区切り。省略時は設定値")
+    fs.add_argument("--note", help="何を確かめる記録か")
+    fs.set_defaults(func=cmd_forward_start)
+
+    fw = sub.add_parser("forward", help="紙トレードの経過を表示")
+    fw.set_defaults(func=cmd_forward)
 
     dg = sub.add_parser("diagnose", help="戦略のどこが悪いのかを診断")
     dg.add_argument("--strategies", help="カンマ区切り。省略時は設定値")

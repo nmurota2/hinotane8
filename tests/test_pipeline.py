@@ -278,3 +278,37 @@ def test_signal_on_the_latest_bar_survives_until_data_arrives(cfg, seeded_db):
         " 承認済みのまま残さないと、翌日の execute が拾えず永久に発注されない。"
     )
     assert seeded_db.query("SELECT * FROM positions WHERE signal_id = ?", [sid]).empty
+
+
+def test_forward_start_fixes_the_start_date(cfg, seeded_db):
+    """紙トレードの開始日を、あとから動かせないこと。
+
+    動かせると「調子の良かった時期からの成績」を選べてしまう。
+    汚染されていない証拠がこの記録しか残っていないので、
+    ここが緩いと最後の検証手段まで意味を失う。
+    """
+    from hinotane.forward import start, status
+
+    first = start(cfg, seeded_db, strategies="trend2", note="検証用")
+    assert "記録を開始しました" in first
+
+    second = start(cfg, seeded_db, strategies="breakout")
+    assert "すでに" in second and "変更できません" in second
+
+    st = status(cfg, seeded_db)
+    assert st.strategies == "trend2", "あとから対象戦略が書き換わっている"
+
+
+def test_forward_status_always_shows_the_benchmark(cfg, seeded_db):
+    """経過表示に、必ず同じ期間の買い持ちが並ぶこと。
+
+    「儲かった＝手法が正しい」と読む失敗を、この探索では何度も起こした。
+    比較相手が無い数字は判断に使えない。
+    """
+    from hinotane.forward import start, status
+
+    start(cfg, seeded_db, strategies="trend2")
+    text = str(status(cfg, seeded_db))
+    assert "同期間の買い持ち" in text
+    assert "差（戦略の付加価値）" in text
+    assert "まだ判断できません" in text, "取引ゼロで判断を出してはいけない"
