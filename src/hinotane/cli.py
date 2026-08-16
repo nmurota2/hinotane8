@@ -35,6 +35,22 @@ def _setup_logging(level: str) -> None:
     )
 
 
+def _looks_doubled(secret: str | None) -> str | None:
+    """同じ文字列が 2 回続いていたら、1 回ぶんを返す。
+
+    ターミナルでの秘密情報の入力は画面に何も表示されないため、
+    「入力できているか不安でもう一度貼る」という二重ペーストが起きやすい。
+    ランダムな鍵の前半と後半がたまたま一致する確率は無視できるので、
+    一致したら二重ペーストと判断してよい。
+    """
+    if not secret:
+        return None
+    n = len(secret)
+    if n >= 8 and n % 2 == 0 and secret[: n // 2] == secret[n // 2 :]:
+        return secret[: n // 2]
+    return None
+
+
 def cmd_init(args, cfg, db) -> int:
     db.init_schema()
     print(f"✅ データベースを初期化しました: {cfg.db_path}")
@@ -81,11 +97,23 @@ def cmd_doctor(args, cfg, db) -> int:
                 # 設定の問題。「アカウントは作ったのに動かない」の大半はプラン未選択。
                 print("❌ J-Quants: 認証に失敗しました")
                 print(f"     {exc}")
-                print("     考えられる原因を可能性の高い順に:")
-                print("     1. ダッシュボードでプラン選択が未完了")
-                print("        （Free プランでも「選択」の操作が必要です）")
-                print("     2. API キーの貼り間違い・コピー漏れ")
-                print("     3. キーを再発行して古いものが残っている")
+
+                half = _looks_doubled(cfg.jquants.api_key)
+                if half:
+                    # 二重ペーストは原因が特定できているので、他の候補より先に出す
+                    print()
+                    print("     🔎 原因が特定できました: API キーが二重に貼られています")
+                    print(f"        （{len(cfg.jquants.api_key or '')} 文字 ＝ 同じ {len(half)} 文字の繰り返し）")
+                    print("        直し方: bash scripts/setup.sh を実行し、")
+                    print("                キーを 1 回だけ貼り付けてください。")
+                    print("                （貼り付けは 1 回でも、画面に何も出ないのが正常です）")
+                else:
+                    print("     考えられる原因を可能性の高い順に:")
+                    print("     1. ダッシュボードでプラン選択が未完了")
+                    print("        （Free プランでも「選択」の操作が必要です）")
+                    print("     2. API キーの貼り間違い・コピー漏れ")
+                    print("     3. キーを再発行して古いものが残っている")
+                    print(f"     （いま設定されているキーは {len(cfg.jquants.api_key or '')} 文字です）")
                 ok = False
             except JQuantsNetworkError as exc:
                 # 到達性の問題。設定を疑わせない。

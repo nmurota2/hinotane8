@@ -73,3 +73,27 @@ def test_base_url_is_normalised_to_v2(configured, expected):
     from hinotane.config import _normalize_jquants_base_url
 
     assert _normalize_jquants_base_url(configured) == expected
+
+
+# ------------------------------------------------------- 二重ペーストの検出
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        # 秘密情報の入力は画面に出ないため、不安になって二重に貼る事故が多い
+        ("abcd1234abcd1234", "abcd1234"),
+        ("x" * 86, "x" * 43),
+        # 二重ではないものを誤検出しない
+        ("abcd1234xyz", None),
+        ("abcd1234", None),
+        # 短すぎるものは判定しない（偶然一致しうるため）
+        ("abab", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_doubled_secret_detection(value, expected):
+    from hinotane.cli import _looks_doubled
+
+    assert _looks_doubled(value) == expected

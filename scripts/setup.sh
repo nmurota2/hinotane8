@@ -146,6 +146,28 @@ read -rs JQ_KEY || true
 printf "\n"
 
 if [ -n "${JQ_KEY:-}" ]; then
+    # 画面に何も出ないため「入力できたか不安でもう一度貼る」二重ペーストが起きやすい。
+    # 同じ文字列が 2 回続いていたら、その場で気づけるようにする。
+    HALVED="$(KEY="$JQ_KEY" "$VENV_PY" - <<'PY'
+import os
+
+key = os.environ["KEY"]
+n = len(key)
+print(key[: n // 2] if n >= 8 and n % 2 == 0 and key[: n // 2] == key[n // 2 :] else "")
+PY
+)"
+    if [ -n "$HALVED" ]; then
+        say ""
+        warn "同じ文字列が2回続いています。貼り付けが二重になった可能性が高いです。"
+        say "   （入力 ${#JQ_KEY} 文字 ＝ ${#HALVED} 文字の繰り返し）"
+        printf "   1回ぶん（%s文字）だけを使いますか？ [Y/n]: " "${#HALVED}"
+        read -r DEDUP_ANSWER || true
+        case "${DEDUP_ANSWER:-}" in
+            [nN]*) warn "入力されたまま保存します" ;;
+            *)     JQ_KEY="$HALVED"; ok "1回ぶんに修正しました" ;;
+        esac
+    fi
+
     set_env JQUANTS_API_KEY "$JQ_KEY"
     ok "APIキーを .env に保存しました（${#JQ_KEY} 文字）"
     unset JQ_KEY
