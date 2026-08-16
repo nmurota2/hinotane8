@@ -190,6 +190,29 @@ hinotane walkforward
 
 ---
 
+## 🔄 更新のしかた（私が修正を加えたとき）
+
+私がコードを直したら、次の2ステップで最新版になります。
+
+### 1. GitHub Desktop で取り込む
+**「Fetch origin」** をクリック → ボタンが **「Pull origin」** に変わるので、もう一度クリック。
+
+### 2. 🔴 ターミナルで再インストール（必ずやってください）
+
+```bash
+bash scripts/update.sh
+```
+
+> **なぜ必要か**: コードを取り込んでも、Python 側の「パッケージがどこにあるか」という
+> 登録情報や、増えた依存パッケージは自動では更新されません。
+> これを飛ばすと `ModuleNotFoundError: No module named 'hinotane'` というエラーになります。
+>
+> `.env` は触らないので、**APIキーなどの設定はそのまま残ります。**
+
+最後に設定の診断まで自動で走るので、これ1つで「更新して確認」が完了します。
+
+---
+
 ## ここまで来たら
 
 次は LINE の設定（[docs/03_setup_guide.md](03_setup_guide.md) の「2. LINE」）です。
@@ -201,6 +224,7 @@ hinotane walkforward
 
 | 症状 | 対処 |
 |---|---|
+| `ModuleNotFoundError: No module named 'hinotane'` | **Pull したあとに再インストールしていません。** `bash scripts/update.sh` を実行してください |
 | `hinotane: command not found` | `source .venv/bin/activate` を忘れています。ターミナルを開き直すたびに必要です |
 | `bash: scripts/setup.sh: No such file` | フォルダの移動（`cd`）ができていません。`ls` で `scripts` が見えるか確認 |
 | `python3 -V` が 3.9 のまま | Python インストール後にターミナルを開き直していません |

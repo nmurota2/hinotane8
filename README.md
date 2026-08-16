@@ -438,10 +438,22 @@ J-Quants が返すカラム名が想定と違っています。エラーメッ�
 
 ---
 
+## 更新
+
+コードを取り込んだあとは、必ず再インストールしてください。
+
+```bash
+git pull                    # または GitHub Desktop の Fetch → Pull
+bash scripts/update.sh      # 再インストール＋設定診断
+```
+
+これを飛ばすと `ModuleNotFoundError: No module named 'hinotane'` になります。
+`.env` は触らないので設定は残ります。
+
 ## 開発
 
 ```bash
-pytest              # テスト（46件）
+pytest              # テスト（82件）
 ruff check src tests
 ```
 
