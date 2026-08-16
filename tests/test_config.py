@@ -138,3 +138,47 @@ def test_request_interval_keeps_a_safety_margin():
 
     fast = JQuantsConfig(api_key="k", requests_per_min=60)
     assert 1.0 < fast.min_request_interval_sec < 2.0
+
+
+def test_plan_command_writes_the_rate_even_when_the_key_is_missing(tmp_path, monkeypatch):
+    """.env にその行が無くても、取得レートを確実に書き込むこと。
+
+    回帰テスト: 以前は `sed -i 's/^JQUANTS_REQUESTS_PER_MIN=.*/.../' .env` と
+    案内していたが、sed は該当行が無いと **何も言わずに何もしない**。
+    有料プランに切り替えたのに 5 回/分のまま 5 年分を取りに行き、
+    30 分で済むはずの取得が 237 分と表示される事故が実際に起きた。
+    """
+    from argparse import Namespace
+
+    from hinotane import cli
+
+    env = tmp_path / ".env"
+    env.write_text("JQUANTS_API_KEY=dummy\n")   # レートの行は無い
+    monkeypatch.setattr(cli_config_module(), "PROJECT_ROOT", tmp_path)
+
+    assert cli.cmd_plan(Namespace(plan="light"), None, None) == 0
+    assert "JQUANTS_REQUESTS_PER_MIN=60" in env.read_text()
+    assert "JQUANTS_API_KEY=dummy" in env.read_text(), "既存の設定を消してはいけない"
+
+
+def test_plan_command_replaces_an_existing_value(tmp_path, monkeypatch):
+    """既にある行は重複させず書き換えること。"""
+    from argparse import Namespace
+
+    from hinotane import cli
+
+    env = tmp_path / ".env"
+    env.write_text("JQUANTS_REQUESTS_PER_MIN=5\nRISK_EQUITY_JPY=1000000\n")
+    monkeypatch.setattr(cli_config_module(), "PROJECT_ROOT", tmp_path)
+
+    assert cli.cmd_plan(Namespace(plan="standard"), None, None) == 0
+    text = env.read_text()
+    assert text.count("JQUANTS_REQUESTS_PER_MIN=") == 1
+    assert "JQUANTS_REQUESTS_PER_MIN=60" in text
+    assert "RISK_EQUITY_JPY=1000000" in text
+
+
+def cli_config_module():
+    from hinotane import config
+
+    return config

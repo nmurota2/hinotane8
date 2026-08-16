@@ -3,6 +3,7 @@
 よく使う順:
     hinotane init                     初期化（DB 作成）
     hinotane doctor                   設定の健康診断（まずこれ）
+    hinotane plan light               契約プランに合わせて取得レートを設定
     hinotane line-test                LINE にテスト送信
     hinotane backfill --years 2       過去データの一括取得（初回のみ・数十分）
     hinotane fetch                    日次の株価更新
@@ -14,7 +15,6 @@
     hinotane walkforward              イン／アウトオブサンプル検証
     hinotane diagnose                 負けている原因を特定
     hinotane serve                    LINE Webhook サーバーを起動
-    hinotane doctor                   設定の健康診断
 """
 
 from __future__ import annotations
@@ -55,6 +55,51 @@ def _looks_doubled(secret: str | None) -> str | None:
 def cmd_init(args, cfg, db) -> int:
     db.init_schema()
     print(f"✅ データベースを初期化しました: {cfg.db_path}")
+    return 0
+
+
+#: 契約プランごとの 1 分あたりリクエスト上限。
+#: 取得速度がこれで決まる。Free のまま有料プランを使うと 12 倍遅い。
+PLAN_RATE_LIMITS = {"free": 5, "light": 60, "standard": 60, "premium": 60}
+
+
+def cmd_plan(args, cfg, db) -> int:
+    """契約プランに合わせて .env の取得レートを設定する。
+
+    以前は「.env を sed で書き換えてください」と案内していたが、
+    その行が .env に無い場合 sed は **何も言わずに何もしない**。
+    設定できたつもりで 12 倍遅いまま数時間走る事故が実際に起きたので、
+    確実に書き込んで結果を表示するコマンドにした。
+    """
+    from .config import PROJECT_ROOT
+
+    plan = args.plan.lower()
+    rate = PLAN_RATE_LIMITS[plan]
+    key = "JQUANTS_REQUESTS_PER_MIN"
+    env_path = PROJECT_ROOT / ".env"
+
+    if not env_path.exists():
+        print(f"❌ {env_path} がありません。先に `bash scripts/setup.sh` を実行してください。")
+        return 1
+
+    lines = env_path.read_text().splitlines()
+    replaced = False
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith(f"{key}=") or stripped.startswith(f"#{key}="):
+            lines[i] = f"{key}={rate}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{key}={rate}")
+    env_path.write_text("\n".join(lines) + "\n")
+
+    print(f"✅ {plan.capitalize()} プランに合わせて {key}={rate} を設定しました")
+    print(f"   （{'書き換え' if replaced else '追記'}: {env_path}）")
+    if plan == "free":
+        print("   ⚠️ Free プランは 12 週間の遅延があるため、当日の銘柄提案は作れません。")
+    else:
+        print("   次: ./hinotane.sh doctor で 60 回/分になっているか確認してください。")
     return 0
 
 
@@ -156,8 +201,10 @@ def cmd_doctor(args, cfg, db) -> int:
             flag = "⚠️ " if age > cfg.stale_data_warn_days else "   "
             print(f"{flag}   最新の株価データ: {latest.date()}（{age} 日前）")
             if age > 60:
-                print("     → J-Quants 無料プランは 12 週間遅延です。")
-                print("       当日判断には Light プラン（月1,650円）以上が必要です。")
+                print("     → 考えられる原因:")
+                print("       ・しばらく `hinotane fetch` / `backfill` を実行していない")
+                print("       ・J-Quants 無料プランを使っている（12 週間の遅延があります。")
+                print("         当日判断には Light プラン（月1,650円）以上が必要です）")
         else:
             print("⚠️    株価データが空です。`hinotane backfill` を実行してください")
     except Exception as exc:
@@ -165,7 +212,12 @@ def cmd_doctor(args, cfg, db) -> int:
         ok = False
 
     print(f"\n    J-Quants の発射レート: {cfg.jquants.requests_per_min} 回/分"
-          f"（Free の上限は 5、Light は 60）")
+          f"（Free の上限は 5、Light 以上は 60）")
+    if cfg.jquants.requests_per_min <= 5:
+        # 有料プランに変えたのに .env を直し忘れると、取得が 12 倍遅いまま走る。
+        # 実際に起きた（5 年分の取得が 30 分で済むところ 237 分と表示された）。
+        print("       有料プランを契約したら `hinotane plan light` を実行してください。")
+        print("       忘れると取得が 12 倍遅いまま走ります。")
     print(f"    戦略: {', '.join(cfg.screener.strategies)}（利用可能: {', '.join(available())}）")
     print(f"    運用資金: {cfg.risk.equity_jpy:,.0f} 円")
     print(f"    1トレードのリスク: {cfg.risk.risk_per_trade:.1%}"
@@ -341,6 +393,10 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("doctor", help="設定の健康診断")
     d.add_argument("--offline", action="store_true", help="外部APIへの接続確認をスキップ")
     d.set_defaults(func=cmd_doctor)
+
+    pl = sub.add_parser("plan", help="契約プランに合わせて取得レートを設定")
+    pl.add_argument("plan", choices=sorted(PLAN_RATE_LIMITS), help="契約中のプラン")
+    pl.set_defaults(func=cmd_plan)
 
     sub.add_parser("line-test", help="LINE にテストメッセージを送る").set_defaults(
         func=cmd_line_test
