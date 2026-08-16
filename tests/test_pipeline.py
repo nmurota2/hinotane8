@@ -138,11 +138,8 @@ def test_backtest_produces_consistent_metrics(cfg, seeded_db):
         assert t.exit_reason in {"stop", "target", "timeout"}
 
 
-def test_backfill_skips_dates_already_fetched(cfg, seeded_db, monkeypatch):
-    """数十分かかる処理なので、取得済みの日付は取りに行かないこと。
-
-    ここが効かないと、途中で中断したときに最初からやり直しになる。
-    """
+def _fake_backfill(cfg, db, monkeypatch, years=2.0):
+    """backfill を実際の通信なしで走らせ、要求された日付を返す。"""
     from hinotane import pipeline
 
     requested: list = []
@@ -156,35 +153,63 @@ def test_backfill_skips_dates_already_fetched(cfg, seeded_db, monkeypatch):
             return pd.DataFrame()
 
     monkeypatch.setattr(pipeline, "JQuantsClient", FakeClient)
+    pipeline.backfill(cfg, db, years=years)
+    return requested
 
-    existing = set(
-        seeded_db.query("SELECT DISTINCT date FROM daily_quotes")["date"].tolist()
+
+def test_backfill_skips_dates_already_fetched(cfg, seeded_db, monkeypatch):
+    """取得済みの日付は取りに行かないこと。
+
+    回帰テスト: DuckDB の DATE 列は pandas.Timestamp で返る。
+    date と Timestamp を比較すると常に不一致になり、スキップが黙って
+    効かなくなる（実機で「取得済み9日」と言いながら全521日を取りに行った）。
+    期待値を明示的に datetime.date で作り、実装側の型変換に依存せず検証する。
+    """
+    from datetime import date as date_type
+    from datetime import timedelta
+
+    from hinotane.config import today
+
+    raw = seeded_db.query("SELECT DISTINCT date FROM daily_quotes")["date"]
+    existing = set(pd.to_datetime(raw).dt.date)
+    assert existing and all(isinstance(d, date_type) for d in existing)
+
+    range_start = today() - timedelta(days=730)
+    overlapping = {d for d in existing if d >= range_start and d.weekday() < 5}
+    assert overlapping, "前提: 既存データが対象期間と重なっていること"
+
+    requested = _fake_backfill(cfg, seeded_db, monkeypatch)
+
+    assert requested and all(isinstance(d, date_type) for d in requested)
+    assert not (overlapping & set(requested)), (
+        f"取得済みの日付を再取得している: {sorted(overlapping & set(requested))[:3]}"
     )
-    assert existing, "前提: 既存データがあること"
-
-    pipeline.backfill(cfg, seeded_db, years=2.0)
-
-    assert requested, "取得対象が 1 日も無いのはおかしい"
-    overlap = existing & set(requested)
-    assert not overlap, f"取得済みの日付を再取得している: {sorted(overlap)[:3]}"
-    # 土日は取引がないので要求しない
-    assert all(d.weekday() < 5 for d in requested)
+    assert all(d.weekday() < 5 for d in requested), "土日は取引がないので要求しない"
 
 
-def test_backfill_is_a_noop_when_everything_is_present(cfg, seeded_db, monkeypatch):
-    from hinotane import pipeline
+def test_backfill_request_count_reflects_the_skip(cfg, seeded_db, monkeypatch):
+    """スキップした日数のぶん、実際の取得対象が減っていること。
 
-    calls: list = []
+    ログ上は「スキップします」と出るのに全日程を取りに行く、
+    という食い違いを防ぐ。
+    """
+    from datetime import timedelta
 
-    class FakeClient:
-        def __init__(self, _cfg):
-            pass
+    from hinotane.config import today
 
-        def daily_quotes_by_date(self, target):
-            calls.append(target)
-            return pd.DataFrame()
+    raw = seeded_db.query("SELECT DISTINCT date FROM daily_quotes")["date"]
+    existing = set(pd.to_datetime(raw).dt.date)
 
-    monkeypatch.setattr(pipeline, "JQuantsClient", FakeClient)
-    # 合成データの範囲だけを対象にすれば、全日付が取得済みになる
-    pipeline.backfill(cfg, seeded_db, years=0.0)
-    assert calls == []
+    run_date = today()
+    range_start = run_date - timedelta(days=730)
+    business_days = {
+        range_start + timedelta(days=i)
+        for i in range((run_date - range_start).days + 1)
+        if (range_start + timedelta(days=i)).weekday() < 5
+    }
+    expected = business_days - existing
+
+    requested = _fake_backfill(cfg, seeded_db, monkeypatch)
+
+    assert set(requested) == expected
+    assert len(requested) < len(business_days), "1 日もスキップできていない"

@@ -87,9 +87,14 @@ def backfill(cfg: AppConfig, db: Database, years: float = 2.0) -> int:
     run_date = today()
     start = run_date - timedelta(days=int(365 * years))
 
-    # 既に DB にある日付は取りに行かない
+    # 既に DB にある日付は取りに行かない。
+    # DuckDB の DATE 列は pandas.Timestamp で返るため、必ず date に揃えてから
+    # 集合にする。ここを揃え忘れると比較が常に不一致になり、
+    # スキップが黙って効かなくなる（実際に起きた）。
     known = db.query("SELECT DISTINCT date FROM daily_quotes")
-    already = set(known["date"].tolist()) if not known.empty else set()
+    already: set[date] = (
+        set(pd.to_datetime(known["date"]).dt.date) if not known.empty else set()
+    )
 
     targets: list[date] = []
     cursor = start
