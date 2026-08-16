@@ -105,13 +105,18 @@ class JQuantsConfig:
     # 上位プランなら .env の JQUANTS_REQUESTS_PER_MIN を上げると取得が速くなる。
     requests_per_min: int = _int("JQUANTS_REQUESTS_PER_MIN", 5)
 
+    # 上限ちょうどの間隔だと、サーバ側の集計の切れ目で弾かれることがある
+    # （実機では 5 回/分の設定でも開始 46 秒で 429 になった）。
+    # 1 回弾かれると 60 秒待たされるので、少し余裕を持たせたほうが結局速い。
+    rate_safety_margin: float = _float("JQUANTS_RATE_SAFETY_MARGIN", 1.2)
+
     @property
     def configured(self) -> bool:
         return bool(self.api_key)
 
     @property
     def min_request_interval_sec(self) -> float:
-        return 60.0 / max(self.requests_per_min, 1)
+        return 60.0 / max(self.requests_per_min, 1) * max(self.rate_safety_margin, 1.0)
 
 
 @dataclass(frozen=True)

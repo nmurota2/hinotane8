@@ -105,10 +105,12 @@ def backfill(cfg: AppConfig, db: Database, years: float = 2.0) -> int:
         return 0
 
     rpm = cfg.jquants.requests_per_min
-    eta_min = len(targets) / max(rpm, 1)
+    interval = cfg.jquants.min_request_interval_sec
+    eta_min = len(targets) * interval / 60.0
     log.info(
-        "%s 〜 %s の %d 日ぶんを取得します（%d 回/分の設定で およそ %d 分）",
-        targets[0], targets[-1], len(targets), rpm, round(eta_min),
+        "%s 〜 %s の %d 日ぶんを取得します"
+        "（%d 回/分の上限に対し %.1f 秒間隔 → およそ %d 分）",
+        targets[0], targets[-1], len(targets), rpm, interval, round(eta_min),
     )
     if rpm <= 5 and eta_min > 30:
         log.info(

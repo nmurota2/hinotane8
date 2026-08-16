@@ -119,3 +119,20 @@ def test_package_is_runnable_as_module():
     )
     assert result.returncode == 0, result.stderr
     assert "doctor" in result.stdout
+
+
+def test_request_interval_keeps_a_safety_margin():
+    """上限ちょうどの間隔で撃たないこと。
+
+    境界で 429 を食らうと 60 秒待たされ、結局そのほうが遅くなる。
+    """
+    from hinotane.config import JQuantsConfig
+
+    cfg = JQuantsConfig(api_key="k", requests_per_min=5)
+    # 5 回/分 = 12 秒間隔。余裕を見て必ずそれより長くする
+    assert cfg.min_request_interval_sec > 12.0
+    # ただし極端に遅くはしない
+    assert cfg.min_request_interval_sec < 20.0
+
+    fast = JQuantsConfig(api_key="k", requests_per_min=60)
+    assert 1.0 < fast.min_request_interval_sec < 2.0
