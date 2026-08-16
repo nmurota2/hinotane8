@@ -381,9 +381,25 @@ def run_research(
                    " 単元株の金額がそれを超える銘柄しかありません。" if pct else "")
             )
             continue
+        pct = er.experiment.risk.get("max_position_pct")
+        note = ""
+        if pct:
+            cap = cfg.risk.equity_jpy * pct
+            note = (
+                f"\n     ⚠️ ただし1銘柄あたり {cap:,.0f} 円までなので、"
+                f"1単元がそれ以下の **安い銘柄だけ** の運用になっています。"
+                "\n        成績の差が「分散」によるものか「安い銘柄」によるものか、"
+                "この実験では区別できません。"
+            )
+        degenerate = ""
+        if len(er.result.trades) < 30:
+            degenerate = (
+                f"\n     ⚠️ 取引 {len(er.result.trades)} 件では期待値を推定できません。"
+                "この行の数字は読まないでください。"
+            )
         out.append(
             f"  {name}: {d:+.2f}R / 取引 {len(er.result.trades)} 件"
-            f" / リターン {er.result.total_return:+.1%}"
+            f" / リターン {er.result.total_return:+.1%}{note}{degenerate}"
         )
     spread = [by_name.get(n) for n in ("⑦ 同時保有を5→15銘柄", "⑧ 同時保有を5→30銘柄")]
     if any(er is not None and er.result.trades for er in spread):

@@ -775,3 +775,61 @@ def test_skips_are_counted_so_the_real_constraint_is_visible(noise_cfg, db):
     assert result.skips["採用"] == len(result.trades), (
         "採用した件数と取引数が一致していない"
     )
+
+
+# ------------------------------------------------ 順位づけの情報量を測る道具
+
+
+def test_information_coefficient_math_is_correct():
+    """順位相関の計算そのものが正しいこと。
+
+    scipy を入れずに済ませるため自前で計算している（順位のピアソン相関）。
+    ここが違っていると、以降の判断が全部ずれる。
+    """
+    import pandas as pd
+
+    from hinotane.factors import _ic_series
+
+    days = pd.to_datetime(["2024-01-04"] * 6 + ["2024-01-05"] * 6)
+    # 指標の順位と、その後の騰落率の順位が完全に一致する作り
+    panel = pd.DataFrame({
+        "date": days,
+        "f": [1, 2, 3, 4, 5, 6] * 2,
+        "fwd20": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06] * 2,
+    })
+    ic = _ic_series(panel, "f", "fwd20")
+    assert len(ic) == 2
+    assert all(abs(v - 1.0) < 1e-9 for v in ic), f"完全一致なら +1.0 のはず: {list(ic)}"
+
+    panel["fwd20"] = list(reversed([0.01, 0.02, 0.03, 0.04, 0.05, 0.06])) * 2
+    ic = _ic_series(panel, "f", "fwd20")
+    assert all(abs(v + 1.0) < 1e-9 for v in ic), f"完全に逆なら -1.0 のはず: {list(ic)}"
+
+
+def test_forward_return_starts_at_the_next_open():
+    """将来の騰落率が「翌営業日の始値から」であること。
+
+    終値基準にすると、その日の終値を見てその日に買えることになり、
+    測っている優位性が実在しないものになる。
+    """
+    import pandas as pd
+
+    from hinotane.factors import _forward_return
+
+    df = pd.DataFrame({"open": [100.0, 110.0, 120.0, 130.0, 140.0]})
+    fwd = _forward_return(df, horizon=2)
+    # 0 行目: 翌日の寄り 110 で買い、その 2 営業日後の寄り 130 で売る
+    assert fwd.iloc[0] == pytest.approx(130 / 110 - 1)
+    assert pd.isna(fwd.iloc[3]), "先のバーが無い行は NaN でなければならない"
+
+
+def test_factor_scan_finds_nothing_in_a_driftless_market(noise_cfg, db):
+    """ノイズしか無い市場で「優位性を見つけた」と言わないこと。"""
+    from hinotane.factors import run_factor_scan
+
+    _driftless_market(db, n_days=520)
+    text = run_factor_scan(noise_cfg, db, max_symbols=40, horizons=(20,))
+    assert "基準を超えた指標" not in text, (
+        "上がりも下がりもしない市場で、順位づけに情報があると報告している"
+    )
+    assert "封印中" in text
