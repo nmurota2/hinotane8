@@ -20,6 +20,7 @@ from hinotane.datasource.jquants import (
     JQuantsAuthError,
     JQuantsClient,
     JQuantsError,
+    JQuantsGoneError,
     JQuantsNetworkError,
     display_code,
 )
@@ -74,6 +75,17 @@ def test_403_raises_auth_error_without_retrying():
     assert len(session.calls) == 1, "認証エラーで無駄なリトライをしている"
 
 
+def test_410_raises_gone_error_pointing_at_base_url():
+    """V1 の URL が残っていると 410 が返る。原因が URL だと分かるメッセージにする。"""
+    session = FakeSession(
+        [FakeResponse(410, text='{"message": "J-QuantsはV2に移行しました。"}')]
+    )
+    with pytest.raises(JQuantsGoneError) as excinfo:
+        _client(session).listed_info()
+    assert "v2" in str(excinfo.value)
+    assert len(session.calls) == 1, "410 は再試行しても無駄"
+
+
 def test_401_raises_auth_error():
     session = FakeSession([FakeResponse(401, text="Unauthorized")])
     with pytest.raises(JQuantsAuthError):
@@ -109,7 +121,7 @@ def test_rate_limit_is_retried_then_succeeds():
         [
             FakeResponse(429, text="Too Many Requests"),
             FakeResponse(429, text="Too Many Requests"),
-            FakeResponse(200, {"info": [{"Code": "13010", "CompanyName": "テスト"}]}),
+            FakeResponse(200, {"data": [{"Code": "13010", "CompanyName": "テスト"}]}),
         ]
     )
     df = _client(session).listed_info()
@@ -120,6 +132,32 @@ def test_rate_limit_is_retried_then_succeeds():
 # ------------------------------------------------------------------ 正規化
 
 
+# V2 の調整後カラム（推奨。分割をまたいでも系列が連続する）
+V2_ADJ_ROW = {
+    "Code": "72030",
+    "Date": "2026-08-07",
+    "O": 1500.0, "H": 1550.0, "L": 1475.0, "C": 1525.0, "Vo": 500_000.0,
+    "AdjO": 3000.0,
+    "AdjH": 3100.0,
+    "AdjL": 2950.0,
+    "AdjC": 3050.0,
+    "AdjVo": 1_000_000.0,
+    "Va": 3_050_000_000.0,
+}
+
+# 調整後カラムを持たないケース（未調整のみ）
+V2_RAW_ROW = {
+    "Code": "72030",
+    "Date": "2026-08-07",
+    "O": 3000.0,
+    "H": 3100.0,
+    "L": 2950.0,
+    "C": 3050.0,
+    "Vo": 1_000_000.0,
+    "Va": 3_050_000_000.0,
+}
+
+# V1 時代の名前（古いデータを読ませたときの保険）
 V1_ROW = {
     "Code": "72030",
     "Date": "2026-08-07",
@@ -131,21 +169,13 @@ V1_ROW = {
     "TurnoverValue": 3_050_000_000.0,
 }
 
-V2_ROW = {
-    "Code": "72030",
-    "Date": "2026-08-07",
-    "O": 3000.0,
-    "H": 3100.0,
-    "L": 2950.0,
-    "C": 3050.0,
-    "V": 1_000_000.0,
-    "TV": 3_050_000_000.0,
-}
 
-
-@pytest.mark.parametrize(("label", "row"), [("V1", V1_ROW), ("V2短縮形", V2_ROW)])
+@pytest.mark.parametrize(
+    ("label", "row"),
+    [("V2調整後", V2_ADJ_ROW), ("V2未調整のみ", V2_RAW_ROW), ("V1互換", V1_ROW)],
+)
 def test_quote_columns_normalised_for_both_api_versions(label, row):
-    session = FakeSession([FakeResponse(200, {"daily_quotes": [row]})])
+    session = FakeSession([FakeResponse(200, {"data": [row]})])
     df = _client(session).daily_quotes_by_date(date(2026, 8, 7))
     assert list(df.columns) == [
         "code", "date", "open", "high", "low", "close", "volume", "turnover_value"
@@ -156,7 +186,7 @@ def test_quote_columns_normalised_for_both_api_versions(label, row):
 
 def test_missing_required_column_reports_actual_columns():
     """未知の形式でも、何が返ってきたかが分かるエラーにする。"""
-    session = FakeSession([FakeResponse(200, {"daily_quotes": [{"Foo": 1, "Bar": 2}]})])
+    session = FakeSession([FakeResponse(200, {"data": [{"Foo": 1, "Bar": 2}]})])
     with pytest.raises(JQuantsError) as excinfo:
         _client(session).daily_quotes_by_date(date(2026, 8, 7))
     message = str(excinfo.value)
@@ -165,18 +195,18 @@ def test_missing_required_column_reports_actual_columns():
 
 def test_turnover_value_falls_back_to_close_times_volume():
     """売買代金を返さない契約プランでも、流動性フィルタが機能すること。"""
-    row = dict(V1_ROW)
-    del row["TurnoverValue"]
-    session = FakeSession([FakeResponse(200, {"daily_quotes": [row]})])
+    row = dict(V2_ADJ_ROW)
+    del row["Va"]
+    session = FakeSession([FakeResponse(200, {"data": [row]})])
     df = _client(session).daily_quotes_by_date(date(2026, 8, 7))
     assert df.iloc[0]["turnover_value"] == pytest.approx(3050.0 * 1_000_000)
 
 
 def test_rows_without_close_are_dropped():
     """売買停止などで終値が無い日は捨てる（指標計算が壊れるため）。"""
-    bad = dict(V1_ROW)
-    bad["AdjustmentClose"] = None
-    session = FakeSession([FakeResponse(200, {"daily_quotes": [bad, V1_ROW]})])
+    bad = dict(V2_ADJ_ROW)
+    bad["AdjC"] = None
+    session = FakeSession([FakeResponse(200, {"data": [bad, V2_ADJ_ROW]})])
     df = _client(session).daily_quotes_by_date(date(2026, 8, 7))
     assert len(df) == 1
 
@@ -187,9 +217,9 @@ def test_rows_without_close_are_dropped():
 def test_pagination_key_is_followed_until_exhausted():
     session = FakeSession(
         [
-            FakeResponse(200, {"info": [{"Code": "1", "CompanyName": "A"}], "pagination_key": "k1"}),
-            FakeResponse(200, {"info": [{"Code": "2", "CompanyName": "B"}], "pagination_key": "k2"}),
-            FakeResponse(200, {"info": [{"Code": "3", "CompanyName": "C"}]}),
+            FakeResponse(200, {"data": [{"Code": "1", "CompanyName": "A"}], "pagination_key": "k1"}),
+            FakeResponse(200, {"data": [{"Code": "2", "CompanyName": "B"}], "pagination_key": "k2"}),
+            FakeResponse(200, {"data": [{"Code": "3", "CompanyName": "C"}]}),
         ]
     )
     df = _client(session).listed_info()
@@ -199,9 +229,56 @@ def test_pagination_key_is_followed_until_exhausted():
 
 
 def test_api_key_is_sent_in_header():
-    session = FakeSession([FakeResponse(200, {"info": []})])
+    session = FakeSession([FakeResponse(200, {"data": []})])
     _client(session).listed_info()
     assert session.calls[0]["headers"]["x-api-key"] == "dummy-key"
+
+
+def test_v2_endpoint_paths_are_used():
+    """V1 のパス（/listed/info, /prices/daily_quotes）を叩かないこと。"""
+    session = FakeSession([FakeResponse(200, {"data": []})])
+    _client(session).listed_info()
+    assert session.calls[0]["url"] == "https://api.jquants.com/v2/equities/master"
+
+    session = FakeSession([FakeResponse(200, {"data": []})])
+    _client(session).daily_quotes_by_date(date(2026, 8, 7))
+    assert session.calls[0]["url"] == "https://api.jquants.com/v2/equities/bars/daily"
+    assert session.calls[0]["params"]["date"] == "2026-08-07"
+
+
+def test_adjusted_columns_win_over_raw():
+    """分割の影響を受けない調整後価格を優先すること。"""
+    session = FakeSession([FakeResponse(200, {"data": [V2_ADJ_ROW]})])
+    df = _client(session).daily_quotes_by_date(date(2026, 8, 7))
+    assert df.iloc[0]["close"] == 3050.0, "未調整の C を拾っている"
+    assert df.iloc[0]["volume"] == 1_000_000.0
+
+
+def test_listed_info_maps_v2_master_columns():
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "data": [
+                        {
+                            "Code": "72030",
+                            "CoName": "トヨタ自動車",
+                            "Mkt": "0111",
+                            "S17": "6",
+                            "S33": "3700",
+                            "ScaleCat": "TOPIX Core30",
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    df = _client(session).listed_info()
+    row = df.iloc[0]
+    assert row["name"] == "トヨタ自動車"
+    assert row["market_code"] == "0111"
+    assert row["sector33_code"] == "3700"
 
 
 # ------------------------------------------------------------------ コード表記

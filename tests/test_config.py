@@ -48,3 +48,28 @@ def test_now_is_naive_so_it_compares_with_duckdb_timestamps():
 
 def test_today_matches_jst_date(utc_host):
     assert today() == datetime.now(JST).date()
+
+
+# ---------------------------------------------------------------- ベースURL
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        # V1 は 2026/6/1 に廃止済み。古い .env が残っていても動くよう読み替える
+        ("https://api.jquants.com/v1", "https://api.jquants.com/v2"),
+        ("https://api.jquants.com/v1/", "https://api.jquants.com/v2"),
+        # 正しい指定はそのまま
+        ("https://api.jquants.com/v2", "https://api.jquants.com/v2"),
+        ("https://api.jquants.com/v2/", "https://api.jquants.com/v2"),
+        # バージョン無しなら補う
+        ("https://api.jquants.com", "https://api.jquants.com/v2"),
+        # 未設定なら既定値
+        ("", "https://api.jquants.com/v2"),
+        (None, "https://api.jquants.com/v2"),
+    ],
+)
+def test_base_url_is_normalised_to_v2(configured, expected):
+    from hinotane.config import _normalize_jquants_base_url
+
+    assert _normalize_jquants_base_url(configured) == expected

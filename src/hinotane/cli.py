@@ -53,26 +53,33 @@ def cmd_doctor(args, cfg, db) -> int:
     # --- J-Quants -----------------------------------------------------
     if not cfg.jquants.configured:
         print("❌ J-Quants: 未設定")
-        print("     .env に JQUANTS_API_KEY（V2）を設定してください。")
-        print("     V1 の場合は JQUANTS_MAIL_ADDRESS + JQUANTS_PASSWORD。")
+        print("     ダッシュボードの［設定］→［API キー］で発行した値を")
+        print("     .env の JQUANTS_API_KEY に設定してください。")
         ok = False
     else:
-        mode = "APIキー (V2)" if cfg.jquants.auth_mode == "apikey" else "トークン (V1)"
+        mode = f"APIキー / {cfg.jquants.base_url}"
         if args.offline:
-            print(f"✅ J-Quants: 設定あり（認証方式: {mode}）※接続確認はスキップ")
+            print(f"✅ J-Quants: 設定あり（{mode}）※接続確認はスキップ")
         else:
             from .datasource.jquants import (
                 JQuantsAuthError,
                 JQuantsClient,
+                JQuantsGoneError,
                 JQuantsNetworkError,
             )
 
             try:
                 listed = JQuantsClient(cfg.jquants).listed_info()
-                print(f"✅ J-Quants: 接続成功（認証方式: {mode} / {len(listed):,} 銘柄）")
+                print(f"✅ J-Quants: 接続成功（{mode} / {len(listed):,} 銘柄）")
+            except JQuantsGoneError as exc:
+                print("❌ J-Quants: 廃止されたエンドポイントを呼び出しました")
+                print(f"     {exc}")
+                print("     .env の JQUANTS_BASE_URL を消すか、次の値にしてください:")
+                print("       JQUANTS_BASE_URL=https://api.jquants.com/v2")
+                ok = False
             except JQuantsAuthError as exc:
                 # 設定の問題。「アカウントは作ったのに動かない」の大半はプラン未選択。
-                print(f"❌ J-Quants: 認証に失敗しました（認証方式: {mode}）")
+                print("❌ J-Quants: 認証に失敗しました")
                 print(f"     {exc}")
                 print("     考えられる原因を可能性の高い順に:")
                 print("     1. ダッシュボードでプラン選択が未完了")
@@ -90,7 +97,7 @@ def cmd_doctor(args, cfg, db) -> int:
                 print("     ・J-Quants 側が一時的に落ちていないか")
                 ok = False
             except Exception as exc:
-                print(f"❌ J-Quants: 予期しないエラー（認証方式: {mode}）")
+                print("❌ J-Quants: 予期しないエラー")
                 print(f"     {exc}")
                 ok = False
 

@@ -1,20 +1,24 @@
-"""J-Quants API クライアント（V1 / V2 両対応）。
+"""J-Quants API（V2）クライアント。
 
-- V2（2025年12月〜）: ダッシュボードで発行した API キーを ``x-api-key`` ヘッダで送る。
-  レスポンスのカラム名が短縮形（Open→O, Close→C など）になっている。
-- V1: メールアドレス/パスワード → リフレッシュトークン → ID トークン の 3 段階。
-  ``Authorization: Bearer <idToken>`` を付ける。
+V1 は 2026年6月1日に廃止済みで、叩くと HTTP 410 が返るだけなので V2 のみ対応する。
 
-どちらのカラム命名でも動くよう、正規化テーブルを通してから返す。
-未知のカラム名だった場合は、実際に返ってきたカラム一覧をエラーに含めるので、
-そのまま報告してもらえれば対応表を 1 行足すだけで直せる。
+V2 の要点（公式クライアント jquants-api-client 2.4.0 のソースで確認）:
+  * ベース URL  : https://api.jquants.com/v2
+  * 認証        : ``x-api-key`` ヘッダに API キーを載せるだけ
+  * 上場銘柄一覧: GET /equities/master          （パラメータ: code, date）
+  * 株価四本値  : GET /equities/bars/daily      （パラメータ: code, date, from, to）
+  * レスポンス  : {"data": [...], "pagination_key": "..."} 形式
+  * カラム名が V1 から短縮された（Close → C、AdjustmentClose → AdjC など）
+
+カラム名は正規化テーブルを通してから返す。未知の名前だった場合は、実際に
+返ってきたカラム一覧をエラーに含めるので、それを見れば対応表を 1 行足すだけで直せる。
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date
 
 import pandas as pd
 import requests
@@ -23,27 +27,32 @@ from ..config import JQuantsConfig
 
 log = logging.getLogger(__name__)
 
+EQ_MASTER_PATH = "/equities/master"
+EQ_BARS_DAILY_PATH = "/equities/bars/daily"
+
 # 正規化後の名前 -> API が返しうる名前の候補（優先度順）。
-# 調整後株価（Adjustment*）を優先する。株式分割をまたいでも連続した系列になり、
-# バックテストが分割で壊れないため。
+#
+# 調整後株価（Adj*）を優先する。株式分割をまたいでも連続した系列になり、
+# バックテストが分割で壊れないため。括弧内は V1 時代の名前で、
+# 古いデータや別経路のデータを読ませたときのための保険。
 _QUOTE_COLUMNS: dict[str, tuple[str, ...]] = {
-    "code": ("Code", "code", "C0", "Ticker"),
-    "date": ("Date", "date", "D"),
-    "open": ("AdjustmentOpen", "AO", "Open", "O", "open"),
-    "high": ("AdjustmentHigh", "AH", "High", "H", "high"),
-    "low": ("AdjustmentLow", "AL", "Low", "L", "low"),
-    "close": ("AdjustmentClose", "AC", "Close", "C", "close"),
-    "volume": ("AdjustmentVolume", "AV", "Volume", "V", "volume"),
-    "turnover_value": ("TurnoverValue", "TV", "turnover_value"),
+    "code": ("Code", "code"),
+    "date": ("Date", "date"),
+    "open": ("AdjO", "O", "AdjustmentOpen", "Open"),
+    "high": ("AdjH", "H", "AdjustmentHigh", "High"),
+    "low": ("AdjL", "L", "AdjustmentLow", "Low"),
+    "close": ("AdjC", "C", "AdjustmentClose", "Close"),
+    "volume": ("AdjVo", "Vo", "AdjustmentVolume", "Volume"),
+    "turnover_value": ("Va", "TurnoverValue"),
 }
 
 _LISTED_COLUMNS: dict[str, tuple[str, ...]] = {
     "code": ("Code", "code"),
-    "name": ("CompanyName", "CN", "name"),
-    "market_code": ("MarketCode", "MC", "market_code"),
-    "sector17_code": ("Sector17Code", "S17", "sector17_code"),
-    "sector33_code": ("Sector33Code", "S33", "sector33_code"),
-    "scale_category": ("ScaleCategory", "SC", "scale_category"),
+    "name": ("CoName", "CompanyName"),
+    "market_code": ("Mkt", "MarketCode"),
+    "sector17_code": ("S17", "Sector17Code"),
+    "sector33_code": ("S33", "Sector33Code"),
+    "scale_category": ("ScaleCat", "ScaleCategory"),
 }
 
 
@@ -66,7 +75,16 @@ class JQuantsNetworkError(JQuantsError):
     """
 
 
-def _normalize(df: pd.DataFrame, mapping: dict[str, tuple[str, ...]], required: set[str]) -> pd.DataFrame:
+class JQuantsGoneError(JQuantsError):
+    """廃止されたエンドポイントを叩いた（HTTP 410）。
+
+    ほぼ確実に V1 の URL が残っている。
+    """
+
+
+def _normalize(
+    df: pd.DataFrame, mapping: dict[str, tuple[str, ...]], required: set[str]
+) -> pd.DataFrame:
     """API のカラム名を内部の正規名に揃える。"""
     out = pd.DataFrame(index=df.index)
     missing: list[str] = []
@@ -104,70 +122,33 @@ class JQuantsClient:
     def __init__(self, cfg: JQuantsConfig):
         self.cfg = cfg
         self._session = requests.Session()
-        self._id_token: str | None = None
-        self._id_token_expires_at: datetime | None = None
-
-    # ------------------------------------------------------------------ 認証
-
-    def _headers(self) -> dict[str, str]:
-        if self.cfg.auth_mode == "apikey":
-            return {"x-api-key": self.cfg.api_key or ""}
-        return {"Authorization": f"Bearer {self._ensure_id_token()}"}
-
-    def _ensure_id_token(self) -> str:
-        now = datetime.now()
-        if self._id_token and self._id_token_expires_at and now < self._id_token_expires_at:
-            return self._id_token
-
-        refresh_token = self.cfg.refresh_token
-        if not refresh_token:
-            if not (self.cfg.mail_address and self.cfg.password):
-                raise JQuantsError(
-                    "J-Quants の認証情報がありません。"
-                    " JQUANTS_API_KEY（V2）か、JQUANTS_REFRESH_TOKEN、"
-                    " または JQUANTS_MAIL_ADDRESS + JQUANTS_PASSWORD を .env に設定してください。"
-                )
-            resp = self._session.post(
-                f"{self.cfg.base_url}/token/auth_user",
-                json={"mailaddress": self.cfg.mail_address, "password": self.cfg.password},
-                timeout=self.cfg.timeout_sec,
-            )
-            if resp.status_code != 200:
-                raise JQuantsAuthError(
-                    f"リフレッシュトークンの取得に失敗: {resp.status_code} {resp.text[:300]}"
-                )
-            refresh_token = resp.json()["refreshToken"]
-
-        resp = self._session.post(
-            f"{self.cfg.base_url}/token/auth_refresh",
-            params={"refreshtoken": refresh_token},
-            timeout=self.cfg.timeout_sec,
-        )
-        if resp.status_code != 200:
-            raise JQuantsAuthError(f"ID トークンの取得に失敗: {resp.status_code} {resp.text[:300]}")
-        self._id_token = resp.json()["idToken"]
-        # ID トークンの寿命は 24 時間。余裕を持って 20 時間で切る。
-        self._id_token_expires_at = datetime.now() + timedelta(hours=20)
-        return self._id_token
 
     # ------------------------------------------------------------------ 低レベル
+
+    def _headers(self) -> dict[str, str]:
+        if not self.cfg.api_key:
+            raise JQuantsAuthError(
+                "J-Quants の API キーが設定されていません。"
+                " ダッシュボードの［設定］→［API キー］で発行して、"
+                " .env の JQUANTS_API_KEY に設定してください。"
+            )
+        return {"x-api-key": self.cfg.api_key}
 
     def _get(self, path: str, params: dict) -> list[dict]:
         """1 エンドポイントを pagination_key が尽きるまで取得する。"""
         url = f"{self.cfg.base_url}{path}"
         rows: list[dict] = []
         page_params = dict(params)
-        data_key: str | None = None
 
         while True:
             payload = self._get_with_retry(url, page_params)
-            if data_key is None:
-                # 'daily_quotes' / 'info' など、エンドポイントごとに配列のキー名が違う
-                candidates = [k for k, v in payload.items() if isinstance(v, list)]
-                if not candidates:
-                    return rows
-                data_key = candidates[0]
-            rows.extend(payload.get(data_key) or [])
+            batch = payload.get("data")
+            if not isinstance(batch, list):
+                # 想定外の形。配列を持つキーがあれば拾う（仕様変更への保険）
+                batch = next(
+                    (v for v in payload.values() if isinstance(v, list)), []
+                )
+            rows.extend(batch)
 
             next_key = payload.get("pagination_key")
             if not next_key:
@@ -196,14 +177,17 @@ class JQuantsClient:
             if resp.status_code == 200:
                 return resp.json()
 
+            if resp.status_code == 410:
+                raise JQuantsGoneError(
+                    "廃止されたエンドポイントを呼び出しました（HTTP 410）。"
+                    f" 呼び出し先: {url}。"
+                    " .env の JQUANTS_BASE_URL が V1 のままになっている可能性があります。"
+                    " 正しくは https://api.jquants.com/v2 です。"
+                )
+
             if resp.status_code in (401, 403):
+                # 再試行しても結果は変わらない
                 auth_failure = True
-                last_err = f"{resp.status_code} {resp.text[:200]}"
-                if self.cfg.auth_mode == "token":
-                    # ID トークン失効の可能性があるので、作り直して再試行する
-                    self._id_token = None
-                    continue
-                # API キー方式では再試行しても結果は変わらない
                 raise JQuantsAuthError(
                     f"認証に失敗しました（{resp.status_code}）: {resp.text[:200]}"
                 )
@@ -226,11 +210,11 @@ class JQuantsClient:
     # ------------------------------------------------------------------ 公開 API
 
     def listed_info(self, target: date | None = None) -> pd.DataFrame:
-        """上場銘柄一覧。"""
+        """上場銘柄一覧（V2: /equities/master）。"""
         params: dict[str, str] = {}
         if target:
             params["date"] = target.strftime("%Y-%m-%d")
-        rows = self._get("/listed/info", params)
+        rows = self._get(EQ_MASTER_PATH, params)
         if not rows:
             return pd.DataFrame(columns=list(_LISTED_COLUMNS))
         df = _normalize(pd.DataFrame(rows), _LISTED_COLUMNS, required={"code", "name"})
@@ -239,13 +223,13 @@ class JQuantsClient:
 
     def daily_quotes_by_date(self, target: date) -> pd.DataFrame:
         """特定日の全銘柄日足。日次更新はこちらが効率的（1 リクエストで全銘柄）。"""
-        rows = self._get("/prices/daily_quotes", {"date": target.strftime("%Y-%m-%d")})
+        rows = self._get(EQ_BARS_DAILY_PATH, {"date": target.strftime("%Y-%m-%d")})
         return self._to_quotes_df(rows)
 
     def daily_quotes_by_code(self, code: str, start: date, end: date) -> pd.DataFrame:
-        """特定銘柄の期間日足。初回のヒストリカル取得に使う。"""
+        """特定銘柄の期間日足。1 銘柄を深く見たいときに使う。"""
         rows = self._get(
-            "/prices/daily_quotes",
+            EQ_BARS_DAILY_PATH,
             {
                 "code": code,
                 "from": start.strftime("%Y-%m-%d"),
@@ -272,3 +256,13 @@ class JQuantsClient:
         df["turnover_value"] = df["turnover_value"].fillna(approx)
         # 終値が無い日（売買停止など）は捨てる
         return df.dropna(subset=["close"]).reset_index(drop=True)
+
+
+__all__ = [
+    "JQuantsAuthError",
+    "JQuantsClient",
+    "JQuantsError",
+    "JQuantsGoneError",
+    "JQuantsNetworkError",
+    "display_code",
+]

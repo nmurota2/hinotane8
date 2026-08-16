@@ -64,34 +64,42 @@ def _list(name: str, default: list[str]) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+JQUANTS_DEFAULT_BASE_URL = "https://api.jquants.com/v2"
+
+
+def _normalize_jquants_base_url(raw: str | None) -> str:
+    """設定された J-Quants のベース URL を V2 に正規化する。
+
+    V1（``.../v1``）は 2026年6月1日に廃止済みで、叩くと HTTP 410 が返るだけ。
+    古い .env が残っていても動くよう、ここで黙って V2 に読み替える。
+    """
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        return JQUANTS_DEFAULT_BASE_URL
+    if url.endswith("/v1"):
+        return url[: -len("/v1")] + "/v2"
+    if not url.endswith("/v2"):
+        return url + "/v2"
+    return url
+
+
 @dataclass(frozen=True)
 class JQuantsConfig:
-    """J-Quants API の接続設定。
+    """J-Quants API（V2）の接続設定。
 
-    V2（2025年12月〜）はダッシュボードで発行した API キーを ``x-api-key`` ヘッダで
-    送る方式。V1 は メールアドレス/パスワード → リフレッシュトークン → ID トークン
-    という 3 段階だった。どちらでも動くようにしてある。
-
-    どちらを使っているか分からない場合は、ダッシュボードに「API キー」の表示が
-    あれば V2、なければ V1。
+    V2 はダッシュボードで発行した API キーを ``x-api-key`` ヘッダで送るだけ。
+    V1 のメールアドレス/パスワード → リフレッシュトークン → ID トークンという
+    3 段階の認証は、V1 の廃止（2026年6月1日）とともに使えなくなっている。
     """
 
-    base_url: str = os.getenv("JQUANTS_BASE_URL", "https://api.jquants.com/v1")
-    api_key: str | None = os.getenv("JQUANTS_API_KEY") or None
-    mail_address: str | None = os.getenv("JQUANTS_MAIL_ADDRESS") or None
-    password: str | None = os.getenv("JQUANTS_PASSWORD") or None
-    refresh_token: str | None = os.getenv("JQUANTS_REFRESH_TOKEN") or None
+    base_url: str = _normalize_jquants_base_url(os.getenv("JQUANTS_BASE_URL"))
+    api_key: str | None = (os.getenv("JQUANTS_API_KEY") or "").strip() or None
     timeout_sec: int = _int("JQUANTS_TIMEOUT_SEC", 30)
     max_retries: int = _int("JQUANTS_MAX_RETRIES", 4)
 
     @property
-    def auth_mode(self) -> str:
-        """'apikey'（V2）か 'token'（V1）か。"""
-        return "apikey" if self.api_key else "token"
-
-    @property
     def configured(self) -> bool:
-        return bool(self.api_key or self.refresh_token or (self.mail_address and self.password))
+        return bool(self.api_key)
 
 
 @dataclass(frozen=True)
