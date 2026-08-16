@@ -22,6 +22,7 @@ from hinotane.datasource.jquants import (
     JQuantsError,
     JQuantsGoneError,
     JQuantsNetworkError,
+    JQuantsOutOfRangeError,
     RateLimiter,
     display_code,
 )
@@ -383,3 +384,34 @@ def test_429_widens_the_interval_for_subsequent_requests(monkeypatch):
     client.listed_info()
 
     assert limiter.min_interval_sec > 10.0, "429 を食らっても間隔が変わっていない"
+
+
+# --------------------------------------------- 契約プランのデータ提供範囲
+
+
+def test_out_of_range_400_is_parsed_with_covered_dates():
+    """提供範囲外の 400 から、契約がカバーする日付を読み取ること。
+
+    無料プランは「直近12週より前の2年ぶん」しか見られない。
+    範囲外を要求し続けても永遠に取れないので、呼び出し側が打ち切れるよう
+    範囲を構造化して渡す。
+    """
+    body = (
+        '{"message": "Your subscription covers the following dates: '
+        "2024-05-24 ~ 2026-05-24. If you want more data, please check other "
+        'plans:https://jpx-jquants.com/#dataset"}'
+    )
+    session = FakeSession([FakeResponse(400, text=body)])
+    with pytest.raises(JQuantsOutOfRangeError) as excinfo:
+        _client(session).daily_quotes_by_date(date(2026, 8, 14))
+
+    assert excinfo.value.covered_from == date(2024, 5, 24)
+    assert excinfo.value.covered_to == date(2026, 5, 24)
+    assert len(session.calls) == 1, "範囲外は再試行しても無駄"
+
+
+def test_other_400s_are_not_treated_as_out_of_range():
+    session = FakeSession([FakeResponse(400, text='{"message": "Bad parameter"}')])
+    with pytest.raises(JQuantsError) as excinfo:
+        _client(session).daily_quotes_by_date(date(2026, 8, 14))
+    assert not isinstance(excinfo.value, JQuantsOutOfRangeError)

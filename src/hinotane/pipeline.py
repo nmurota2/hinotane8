@@ -18,7 +18,11 @@ import pandas as pd
 
 from .broker import OrderRequest, get_broker
 from .config import AppConfig, now, today
-from .datasource.jquants import JQuantsClient, display_code
+from .datasource.jquants import (
+    JQuantsClient,
+    JQuantsOutOfRangeError,
+    display_code,
+)
 from .db import Database
 from .notify import console
 from .notify.line import LineNotifier
@@ -62,6 +66,13 @@ def fetch_quotes(cfg: AppConfig, db: Database, days: int = 10) -> int:
             continue
         try:
             df = client.daily_quotes_by_date(target)
+        except JQuantsOutOfRangeError as exc:
+            log.warning(
+                "%s は契約プランのデータ提供範囲外です（提供範囲: %s 〜 %s）。"
+                " 無料プランは 12 週間遅延のため、当日データには上位プランが必要です。",
+                target, exc.covered_from, exc.covered_to,
+            )
+            continue
         except Exception as exc:
             log.warning("%s の取得に失敗（スキップ）: %s", target, exc)
             continue
@@ -132,6 +143,20 @@ def backfill(cfg: AppConfig, db: Database, years: float = 2.0) -> int:
     for i, target in enumerate(targets, start=1):
         try:
             df = client.daily_quotes_by_date(target)
+        except JQuantsOutOfRangeError as exc:
+            # 契約プランのデータ提供範囲を超えた。この先の日付も必ず同じ結果に
+            # なるので、待つだけ無駄。打ち切る（実機で 60 日ぶん＝16 分を空費した）。
+            log.info(
+                "%s は契約プランのデータ提供範囲外です（提供範囲: %s 〜 %s）。"
+                " これ以降の日付も同じなので取得を打ち切ります。",
+                target, exc.covered_from, exc.covered_to,
+            )
+            if exc.covered_to:
+                log.info(
+                    "より新しいデータが必要な場合は上位プランをご検討ください: "
+                    "https://jpx-jquants.com/#dataset"
+                )
+            break
         except Exception as exc:
             log.warning("%s の取得に失敗（スキップ）: %s", target, exc)
             df = pd.DataFrame()

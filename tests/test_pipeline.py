@@ -213,3 +213,38 @@ def test_backfill_request_count_reflects_the_skip(cfg, seeded_db, monkeypatch):
 
     assert set(requested) == expected
     assert len(requested) < len(business_days), "1 日もスキップできていない"
+
+
+def test_backfill_stops_at_the_subscription_boundary(cfg, seeded_db, monkeypatch):
+    """契約範囲を超えたら打ち切ること。
+
+    実機では範囲外の 60 日ぶんを 16 秒間隔で叩き続け、約16分を空費した。
+    その先も必ず同じ結果になるので、1 回分かった時点で止める。
+    """
+    from datetime import date as date_type
+
+    from hinotane import pipeline
+    from hinotane.datasource.jquants import JQuantsOutOfRangeError
+
+    boundary = date_type(2025, 6, 1)
+    requested: list = []
+
+    class FakeClient:
+        def __init__(self, _cfg):
+            pass
+
+        def daily_quotes_by_date(self, target):
+            requested.append(target)
+            if target > boundary:
+                raise JQuantsOutOfRangeError(
+                    "範囲外", date_type(2024, 5, 24), boundary
+                )
+            return pd.DataFrame()
+
+    monkeypatch.setattr(pipeline, "JQuantsClient", FakeClient)
+    pipeline.backfill(cfg, seeded_db, years=2.0)
+
+    beyond = [d for d in requested if d > boundary]
+    assert len(beyond) == 1, (
+        f"境界を越えたあとも {len(beyond)} 回要求している（1 回で打ち切るべき）"
+    )

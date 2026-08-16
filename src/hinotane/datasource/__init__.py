@@ -4,6 +4,8 @@ from .jquants import (
     JQuantsError,
     JQuantsGoneError,
     JQuantsNetworkError,
+    JQuantsOutOfRangeError,
+    RateLimiter,
     display_code,
 )
 
@@ -13,5 +15,7 @@ __all__ = [
     "JQuantsError",
     "JQuantsGoneError",
     "JQuantsNetworkError",
+    "JQuantsOutOfRangeError",
+    "RateLimiter",
     "display_code",
 ]

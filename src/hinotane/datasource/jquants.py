@@ -17,8 +17,9 @@ V2 の要点（公式クライアント jquants-api-client 2.4.0 のソースで
 from __future__ import annotations
 
 import logging
+import re
 import time
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import requests
@@ -80,6 +81,38 @@ class JQuantsGoneError(JQuantsError):
 
     ほぼ確実に V1 の URL が残っている。
     """
+
+
+class JQuantsOutOfRangeError(JQuantsError):
+    """契約プランのデータ提供範囲外の日付を要求した（HTTP 400）。
+
+    無料プランは「直近 12 週間より前の 2 年ぶん」といった窓しか見られない。
+    範囲外を要求し続けても永遠に取れないので、呼び出し側は打ち切ってよい。
+    """
+
+    def __init__(self, message: str, covered_from: date | None, covered_to: date | None):
+        super().__init__(message)
+        self.covered_from = covered_from
+        self.covered_to = covered_to
+
+
+_COVERED_RANGE_RE = re.compile(
+    r"covers the following dates:\s*(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})"
+)
+
+
+def _parse_covered_range(body: str) -> tuple[date | None, date | None]:
+    """400 の本文から、契約が対象とする日付範囲を読み取る。"""
+    m = _COVERED_RANGE_RE.search(body or "")
+    if not m:
+        return None, None
+    try:
+        return (
+            datetime.strptime(m.group(1), "%Y-%m-%d").date(),
+            datetime.strptime(m.group(2), "%Y-%m-%d").date(),
+        )
+    except ValueError:
+        return None, None
 
 
 def _normalize(
@@ -276,6 +309,15 @@ class JQuantsClient:
                 time.sleep(2**attempt)
                 continue
 
+            if resp.status_code == 400 and "covers the following dates" in resp.text:
+                covered_from, covered_to = _parse_covered_range(resp.text)
+                raise JQuantsOutOfRangeError(
+                    "契約プランのデータ提供範囲外の日付です"
+                    f"（提供範囲: {covered_from} 〜 {covered_to}）。",
+                    covered_from,
+                    covered_to,
+                )
+
             raise JQuantsError(f"J-Quants API エラー {resp.status_code}: {resp.text[:300]}")
 
         if network_failure:
@@ -343,5 +385,7 @@ __all__ = [
     "JQuantsError",
     "JQuantsGoneError",
     "JQuantsNetworkError",
+    "JQuantsOutOfRangeError",
+    "RateLimiter",
     "display_code",
 ]
