@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 
@@ -77,31 +77,58 @@ def fetch_quotes(cfg: AppConfig, db: Database, days: int = 10) -> int:
 def backfill(cfg: AppConfig, db: Database, years: float = 2.0) -> int:
     """初回のヒストリカル一括取得。
 
+    数十分かかる処理なので、**取得済みの日付は飛ばす**。
+    途中で止めても、もう一度実行すれば続きから再開できる。
+
     無料プランは 12 週間遅延なので直近データは空で返る。
     バックテスト用の過去データを貯める目的なら無料プランでも十分機能する。
     """
     client = JQuantsClient(cfg.jquants)
     run_date = today()
     start = run_date - timedelta(days=int(365 * years))
+
+    # 既に DB にある日付は取りに行かない
+    known = db.query("SELECT DISTINCT date FROM daily_quotes")
+    already = set(known["date"].tolist()) if not known.empty else set()
+
+    targets: list[date] = []
+    cursor = start
+    while cursor <= run_date:
+        if cursor.weekday() < 5 and cursor not in already:  # 土日は取引がない
+            targets.append(cursor)
+        cursor += timedelta(days=1)
+
+    if already:
+        log.info("取得済み %d 日ぶんはスキップします", len(already))
+    if not targets:
+        log.info("取得すべき日付はありません（すべて取得済み）")
+        return 0
+
+    log.info("%s 〜 %s の %d 日ぶんを取得します", targets[0], targets[-1], len(targets))
+
     total = 0
     empty_streak = 0
+    # 進捗は 20 回程度に抑える。多すぎると読めず、少なすぎると止まって見える。
+    report_every = max(len(targets) // 20, 1)
 
-    target = start
-    while target <= run_date:
-        if target.weekday() < 5:
-            try:
-                df = client.daily_quotes_by_date(target)
-            except Exception as exc:
-                log.warning("%s の取得に失敗（スキップ）: %s", target, exc)
-                df = pd.DataFrame()
-            if df.empty:
-                empty_streak += 1
-            else:
-                empty_streak = 0
-                total += db.upsert_quotes(df)
-                if total % 50_000 < len(df):
-                    log.info("... %s まで取得: 累計 %d 件", target, total)
-        target += timedelta(days=1)
+    for i, target in enumerate(targets, start=1):
+        try:
+            df = client.daily_quotes_by_date(target)
+        except Exception as exc:
+            log.warning("%s の取得に失敗（スキップ）: %s", target, exc)
+            df = pd.DataFrame()
+
+        if df.empty:
+            empty_streak += 1
+        else:
+            empty_streak = 0
+            total += db.upsert_quotes(df)
+
+        if i % report_every == 0 or i == len(targets):
+            log.info(
+                "進捗 %d/%d（%.0f%%） %s まで完了 / 累計 %s 件",
+                i, len(targets), i / len(targets) * 100, target, f"{total:,}",
+            )
 
     if empty_streak > 40:
         log.warning(
@@ -109,7 +136,7 @@ def backfill(cfg: AppConfig, db: Database, years: float = 2.0) -> int:
             " 当日データが必要なら Light プラン以上を検討してください。",
             empty_streak,
         )
-    log.info("ヒストリカル取得完了: %d 件", total)
+    log.info("ヒストリカル取得完了: %s 件", f"{total:,}")
     return total
 
 

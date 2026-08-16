@@ -136,3 +136,55 @@ def test_backtest_produces_consistent_metrics(cfg, seeded_db):
         assert (t.pnl_jpy > 0) == (t.r_multiple > 0) or t.pnl_jpy == 0
         assert t.exit_date >= t.entry_date
         assert t.exit_reason in {"stop", "target", "timeout"}
+
+
+def test_backfill_skips_dates_already_fetched(cfg, seeded_db, monkeypatch):
+    """数十分かかる処理なので、取得済みの日付は取りに行かないこと。
+
+    ここが効かないと、途中で中断したときに最初からやり直しになる。
+    """
+    from hinotane import pipeline
+
+    requested: list = []
+
+    class FakeClient:
+        def __init__(self, _cfg):
+            pass
+
+        def daily_quotes_by_date(self, target):
+            requested.append(target)
+            return pd.DataFrame()
+
+    monkeypatch.setattr(pipeline, "JQuantsClient", FakeClient)
+
+    existing = set(
+        seeded_db.query("SELECT DISTINCT date FROM daily_quotes")["date"].tolist()
+    )
+    assert existing, "前提: 既存データがあること"
+
+    pipeline.backfill(cfg, seeded_db, years=2.0)
+
+    assert requested, "取得対象が 1 日も無いのはおかしい"
+    overlap = existing & set(requested)
+    assert not overlap, f"取得済みの日付を再取得している: {sorted(overlap)[:3]}"
+    # 土日は取引がないので要求しない
+    assert all(d.weekday() < 5 for d in requested)
+
+
+def test_backfill_is_a_noop_when_everything_is_present(cfg, seeded_db, monkeypatch):
+    from hinotane import pipeline
+
+    calls: list = []
+
+    class FakeClient:
+        def __init__(self, _cfg):
+            pass
+
+        def daily_quotes_by_date(self, target):
+            calls.append(target)
+            return pd.DataFrame()
+
+    monkeypatch.setattr(pipeline, "JQuantsClient", FakeClient)
+    # 合成データの範囲だけを対象にすれば、全日付が取得済みになる
+    pipeline.backfill(cfg, seeded_db, years=0.0)
+    assert calls == []
