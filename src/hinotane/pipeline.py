@@ -104,7 +104,18 @@ def backfill(cfg: AppConfig, db: Database, years: float = 2.0) -> int:
         log.info("取得すべき日付はありません（すべて取得済み）")
         return 0
 
-    log.info("%s 〜 %s の %d 日ぶんを取得します", targets[0], targets[-1], len(targets))
+    rpm = cfg.jquants.requests_per_min
+    eta_min = len(targets) / max(rpm, 1)
+    log.info(
+        "%s 〜 %s の %d 日ぶんを取得します（%d 回/分の設定で およそ %d 分）",
+        targets[0], targets[-1], len(targets), rpm, round(eta_min),
+    )
+    if rpm <= 5 and eta_min > 30:
+        log.info(
+            "Free プランの上限（5 回/分）に合わせて間隔を空けます。"
+            " 短くしたい場合は --years 1 にするか、Light プラン（60 回/分）にして"
+            " .env に JQUANTS_REQUESTS_PER_MIN=60 を設定してください。"
+        )
 
     total = 0
     empty_streak = 0

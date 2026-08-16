@@ -97,9 +97,21 @@ class JQuantsConfig:
     timeout_sec: int = _int("JQUANTS_TIMEOUT_SEC", 30)
     max_retries: int = _int("JQUANTS_MAX_RETRIES", 4)
 
+    # 1 分あたりのリクエスト数の上限。**契約プランごとに決まっている。**
+    #   Free  :  5 回/分
+    #   Light : 60 回/分
+    # 超えると 429 が返り、大幅に超え続けると 5 分ほど完全にブロックされる。
+    # 安全側に倒して Free の値を既定にしてある。
+    # 上位プランなら .env の JQUANTS_REQUESTS_PER_MIN を上げると取得が速くなる。
+    requests_per_min: int = _int("JQUANTS_REQUESTS_PER_MIN", 5)
+
     @property
     def configured(self) -> bool:
         return bool(self.api_key)
+
+    @property
+    def min_request_interval_sec(self) -> float:
+        return 60.0 / max(self.requests_per_min, 1)
 
 
 @dataclass(frozen=True)

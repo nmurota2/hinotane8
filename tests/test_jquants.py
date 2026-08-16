@@ -22,15 +22,23 @@ from hinotane.datasource.jquants import (
     JQuantsError,
     JQuantsGoneError,
     JQuantsNetworkError,
+    RateLimiter,
     display_code,
 )
 
 
 class FakeResponse:
-    def __init__(self, status_code: int, payload: dict | None = None, text: str = ""):
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict | None = None,
+        text: str = "",
+        headers: dict | None = None,
+    ):
         self.status_code = status_code
         self._payload = payload or {}
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -59,7 +67,8 @@ def no_sleep(monkeypatch):
 
 def _client(session, **cfg_kwargs) -> JQuantsClient:
     cfg = JQuantsConfig(api_key="dummy-key", max_retries=3, **cfg_kwargs)
-    client = JQuantsClient(cfg)
+    # レート制限のテストが実時間で待たないよう、間隔ゼロの専用リミッタを渡す
+    client = JQuantsClient(cfg, limiter=RateLimiter(0.0))
     client._session = session
     return client
 
@@ -114,6 +123,53 @@ def test_network_error_and_auth_error_are_both_jquants_error():
     """呼び出し側が JQuantsError だけ捕まえれば済むようにしておく。"""
     assert issubclass(JQuantsAuthError, JQuantsError)
     assert issubclass(JQuantsNetworkError, JQuantsError)
+
+
+def test_rate_limit_honours_retry_after_header(monkeypatch):
+    """429 に Retry-After があれば、その秒数だけ待つこと。"""
+    slept: list[float] = []
+    monkeypatch.setattr("hinotane.datasource.jquants.time.sleep", slept.append)
+
+    session = FakeSession(
+        [
+            FakeResponse(429, text="Rate limit exceeded", headers={"Retry-After": "37"}),
+            FakeResponse(200, {"data": []}),
+        ]
+    )
+    _client(session).listed_info()
+    assert 37.0 in slept, f"Retry-After を無視している: {slept}"
+
+
+def test_rate_limit_waits_a_full_window_when_no_retry_after(monkeypatch):
+    """Retry-After が無いときは、秒単位ではなく制限枠が空くまで待つこと。
+
+    1〜8 秒の再試行では 5 回/分の制限を抜けられず、
+    延々と失敗し続ける（実機で発生した）。
+    """
+    slept: list[float] = []
+    monkeypatch.setattr("hinotane.datasource.jquants.time.sleep", slept.append)
+
+    session = FakeSession(
+        [
+            FakeResponse(429, text="Rate limit exceeded"),
+            FakeResponse(200, {"data": []}),
+        ]
+    )
+    _client(session).listed_info()
+    assert slept and max(slept) >= 60.0, f"待機が短すぎる: {slept}"
+
+
+def test_rate_limiter_spaces_out_requests(monkeypatch):
+    """プラン上限に合わせて、リクエスト間隔を空けること。"""
+    slept: list[float] = []
+    monkeypatch.setattr("hinotane.datasource.jquants.time.sleep", slept.append)
+
+    # Free プラン = 5 回/分 → 12 秒間隔
+    limiter = RateLimiter(60.0 / 5)
+    limiter.wait()   # 1 回目は待たない
+    assert slept == []
+    limiter.wait()   # 2 回目は間隔を空ける
+    assert slept and slept[0] > 11.0, f"間隔が空いていない: {slept}"
 
 
 def test_rate_limit_is_retried_then_succeeds():

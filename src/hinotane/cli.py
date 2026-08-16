@@ -163,7 +163,9 @@ def cmd_doctor(args, cfg, db) -> int:
         print(f"❌ DB: {exc}")
         ok = False
 
-    print(f"\n    戦略: {', '.join(cfg.screener.strategies)}（利用可能: {', '.join(available())}）")
+    print(f"\n    J-Quants の発射レート: {cfg.jquants.requests_per_min} 回/分"
+          f"（Free の上限は 5、Light は 60）")
+    print(f"    戦略: {', '.join(cfg.screener.strategies)}（利用可能: {', '.join(available())}）")
     print(f"    運用資金: {cfg.risk.equity_jpy:,.0f} 円")
     print(f"    1トレードのリスク: {cfg.risk.risk_per_trade:.1%}"
           f" = {cfg.risk.equity_jpy * cfg.risk.risk_per_trade:,.0f} 円")

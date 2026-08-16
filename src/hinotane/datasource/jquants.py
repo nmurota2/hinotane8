@@ -118,10 +118,53 @@ def display_code(code: str) -> str:
     return code
 
 
+class RateLimiter:
+    """リクエストの間隔を空けて、プランごとの上限を超えないようにする。
+
+    J-Quants V2 は契約プランごとに「1 分あたりのリクエスト数」の上限があり、
+    Free は 5 回/分と厳しい。超えると 429 が返るだけでなく、
+    大幅に超え続けると 5 分ほど完全にブロックされてしまう。
+    後追いで再試行するより、最初から間隔を空けて叩くほうが速く確実に終わる。
+    """
+
+    def __init__(self, min_interval_sec: float):
+        self.min_interval_sec = max(min_interval_sec, 0.0)
+        self._last_request_at: float | None = None
+
+    def wait(self) -> None:
+        if self._last_request_at is not None:
+            elapsed = time.monotonic() - self._last_request_at
+            remaining = self.min_interval_sec - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_request_at = time.monotonic()
+
+
+# プロセス内でレート制限を共有する。fetch_listed と backfill のように
+# 別々にクライアントを作る箇所があっても、合計の発射レートが上限を超えないようにする。
+_SHARED_LIMITERS: dict[float, RateLimiter] = {}
+
+
+def shared_limiter(min_interval_sec: float) -> RateLimiter:
+    return _SHARED_LIMITERS.setdefault(min_interval_sec, RateLimiter(min_interval_sec))
+
+
+def _retry_after_seconds(resp: requests.Response) -> float | None:
+    """429 のレスポンスに Retry-After があれば秒数として返す。"""
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return None
+
+
 class JQuantsClient:
-    def __init__(self, cfg: JQuantsConfig):
+    def __init__(self, cfg: JQuantsConfig, limiter: RateLimiter | None = None):
         self.cfg = cfg
         self._session = requests.Session()
+        self._limiter = limiter or shared_limiter(cfg.min_request_interval_sec)
 
     # ------------------------------------------------------------------ 低レベル
 
@@ -161,6 +204,7 @@ class JQuantsClient:
         auth_failure = False
 
         for attempt in range(self.cfg.max_retries):
+            self._limiter.wait()
             try:
                 resp = self._session.get(
                     url, params=params, headers=self._headers(), timeout=self.cfg.timeout_sec
@@ -192,7 +236,22 @@ class JQuantsClient:
                     f"認証に失敗しました（{resp.status_code}）: {resp.text[:200]}"
                 )
 
-            if resp.status_code in (429, 500, 502, 503, 504):
+            if resp.status_code == 429:
+                # レート制限は「時間が経てば必ず解ける」ので、秒単位の
+                # 短い再試行ではなく、制限枠が空くまでしっかり待つ。
+                # 大幅超過を続けると 5 分ほどブロックされるため、徐々に延ばす。
+                wait_sec = _retry_after_seconds(resp) or min(60.0 * (attempt + 1), 300.0)
+                last_err = f"429 {resp.text[:120]}"
+                log.warning(
+                    "レート制限に達しました。%.0f 秒待機します"
+                    "（現在の設定: %d 回/分。Free プランの上限は 5 回/分です）",
+                    wait_sec,
+                    self.cfg.requests_per_min,
+                )
+                time.sleep(wait_sec)
+                continue
+
+            if resp.status_code in (500, 502, 503, 504):
                 last_err = f"{resp.status_code} {resp.text[:200]}"
                 time.sleep(2**attempt)
                 continue
