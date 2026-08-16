@@ -308,6 +308,11 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
     判定は必ず日足の高値・安値で行う。終値だけで判定すると、
     ザラ場中に損切り価格を割っていた事実を見逃して成績が実態より良く出る。
     同じ日に損切りと利確の両方に触れた場合は、保守的に損切り側を採用する。
+
+    バックテスト（backtest.py）と同じ約定モデルを使うこと。片方だけ甘いと、
+    検証結果と実運用の成績が食い違う。具体的には次の 2 点を揃えている:
+      * **エントリー当日も判定対象に含める**（買った初日に損切りは普通に起きる）
+      * **ギャップを織り込む**（損切り価格を割って寄り付いたら約定は寄り値）
     """
     started = now()
     broker = get_broker(cfg, db)
@@ -324,7 +329,7 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
             """
             SELECT date, open, high, low, close
             FROM daily_quotes
-            WHERE code = ? AND date > ?
+            WHERE code = ? AND date >= ?
             ORDER BY date
             """,
             [pos["code"], pos["entry_date"]],
@@ -342,12 +347,15 @@ def run_mark(cfg: AppConfig, db: Database) -> int:
         exit_price: float | None = None
         exit_reason = ""
 
-        for held, (_, bar) in enumerate(bars.iterrows(), start=1):
+        for held, (_, bar) in enumerate(bars.iterrows()):
+            bar_open = float(bar["open"])
             if bar["low"] <= stop:
-                exit_price, exit_reason = stop, "stop"
+                # 損切り価格を割って寄り付いたら、実際の約定は寄り値になる
+                exit_price, exit_reason = min(bar_open, stop), "stop"
                 break
             if bar["high"] >= target:
-                exit_price, exit_reason = target, "target"
+                # 利確は指値。目標より上で寄り付いたらその寄り値
+                exit_price, exit_reason = max(bar_open, target), "target"
                 break
             if held >= max_days:
                 exit_price, exit_reason = float(bar["close"]), "timeout"

@@ -118,13 +118,20 @@ def _build_signal_table(
     if universe.empty:
         return pd.DataFrame(), {}, {}
 
-    # 流動性の高い順に絞る（薄い銘柄はどのみち足切りされる）
     codes = universe["code"].tolist()
     names = dict(zip(universe["code"], universe["name"], strict=True))
     bars_by_code = db.bars_bulk(codes, limit_days=100_000)
 
+    # 計算量を抑えるため流動性の高い順に絞る。
+    #
+    # ⚠️ ここは必ず **期間の先頭** の流動性で判定する。
+    # 末尾（tail）で判定すると「検証期間の終わりに流動性が高かった銘柄」を
+    # 期間の初めから売買することになる。売買代金は株価×出来高なので、
+    # これは実質「値上がりした銘柄だけを選んで検証する」ことに等しく、
+    # 何を試しても勝っているように見えてしまう。
+    # 先頭 60 本なら、売買を始める時点で分かっている情報だけで選べる。
     liquidity = {
-        code: float(df["turnover_value"].tail(60).mean() or 0) for code, df in bars_by_code.items()
+        code: float(df["turnover_value"].head(60).mean() or 0) for code, df in bars_by_code.items()
     }
     codes = sorted(liquidity, key=lambda c: liquidity[c], reverse=True)[:max_symbols]
 
@@ -217,7 +224,63 @@ def run_backtest(
     fee = cfg.execution.commission_pct
 
     for i, today in enumerate(all_dates):
-        # ---- 1. 建玉の決済判定（当日の高値・安値で） ----------------------
+        # ---- 1. 前営業日のシグナルを、当日の始値でエントリー ---------------
+        #
+        # 決済判定より先に行う。寄り付きの時点では、その日のうちに
+        # どの建玉が決済されるかを知りようがないため、決済で空いた枠を
+        # 同じ日のエントリーに使えてしまうのは未来を覗いていることになる。
+        if i > 0:
+            prev = all_dates[i - 1]
+            candidates = signals_by_date.get(prev)
+            if candidates is not None:
+                held_codes = {p["code"] for p in open_positions}
+                taken = 0
+                for _, sig in candidates.iterrows():
+                    if len(open_positions) >= cfg.risk.max_open_positions:
+                        break
+                    if taken >= cfg.risk.max_signals_per_day:
+                        break
+                    code = sig["code"]
+                    if code in held_codes or today not in prices[code].index:
+                        continue
+
+                    raw_open = float(prices[code].loc[today, "open"])
+                    if not math.isfinite(raw_open) or raw_open <= 0:
+                        continue
+                    entry_price = raw_open * (1 + slip)
+                    stop = float(sig["stop_price"])
+                    # 寄り付きの時点で既に損切り価格を割っているなら見送る
+                    if stop >= raw_open:
+                        continue
+
+                    risk_per_share = entry_price - stop
+                    qty = int(math.floor(equity * cfg.risk.risk_per_trade / risk_per_share / lot) * lot)
+                    max_cost = equity * cfg.risk.max_position_pct
+                    if qty * entry_price > max_cost:
+                        qty = int(math.floor(max_cost / entry_price / lot) * lot)
+                    if qty < lot:
+                        continue
+
+                    open_positions.append(
+                        {
+                            "code": code,
+                            "strategy": sig["strategy"],
+                            "entry_date": today,
+                            "entry_price": entry_price,
+                            "quantity": qty,
+                            "stop": stop,
+                            "target": float(sig["target_price"]),
+                            "max_holding_days": int(sig["max_holding_days"]),
+                        }
+                    )
+                    held_codes.add(code)
+                    taken += 1
+
+        # ---- 2. 建玉の決済判定（当日の高値・安値で） ----------------------
+        #
+        # **当日エントリーした建玉も対象に含める。** 買った初日に損切り価格を
+        # 割ることは普通に起きる。ここを翌日以降からにすると、本来なら
+        # その日に損切りされた取引が生き延びて、成績が実態より良く出る。
         still_open: list[dict] = []
         for pos in open_positions:
             bar = prices[pos["code"]].loc[today] if today in prices[pos["code"]].index else None
@@ -226,11 +289,20 @@ def run_backtest(
                 continue
 
             held = i - date_index[pos["entry_date"]]
+            bar_open = float(bar["open"])
             exit_price = exit_reason = None
+
             if bar["low"] <= pos["stop"]:
-                exit_price, exit_reason = pos["stop"], "stop"
+                # 損切りは「その価格で必ず約定する」とは限らない。
+                # 損切り価格を下回って寄り付いたら、実際の約定は寄り値になる。
+                # ここを stop 固定にすると、ギャップダウンの損失が消えて
+                # 成績が実態より良く出る。
+                exit_price = min(bar_open, pos["stop"])
+                exit_reason = "stop"
             elif bar["high"] >= pos["target"]:
-                exit_price, exit_reason = pos["target"], "target"
+                # 利確は指値。目標より上で寄り付いたらその寄り値で約定する。
+                exit_price = max(bar_open, pos["target"])
+                exit_reason = "target"
             elif held >= pos["max_holding_days"]:
                 exit_price, exit_reason = float(bar["close"]), "timeout"
 
@@ -261,53 +333,6 @@ def run_backtest(
                 )
             )
         open_positions = still_open
-
-        # ---- 2. 前営業日のシグナルを、当日の始値でエントリー ---------------
-        if i > 0:
-            prev = all_dates[i - 1]
-            candidates = signals_by_date.get(prev)
-            if candidates is not None:
-                held_codes = {p["code"] for p in open_positions}
-                taken = 0
-                for _, sig in candidates.iterrows():
-                    if len(open_positions) >= cfg.risk.max_open_positions:
-                        break
-                    if taken >= cfg.risk.max_signals_per_day:
-                        break
-                    code = sig["code"]
-                    if code in held_codes or today not in prices[code].index:
-                        continue
-
-                    raw_open = float(prices[code].loc[today, "open"])
-                    if not math.isfinite(raw_open) or raw_open <= 0:
-                        continue
-                    entry_price = raw_open * (1 + slip)
-                    stop = float(sig["stop_price"])
-                    if stop >= entry_price:
-                        continue
-
-                    risk_per_share = entry_price - stop
-                    qty = int(math.floor(equity * cfg.risk.risk_per_trade / risk_per_share / lot) * lot)
-                    max_cost = equity * cfg.risk.max_position_pct
-                    if qty * entry_price > max_cost:
-                        qty = int(math.floor(max_cost / entry_price / lot) * lot)
-                    if qty < lot:
-                        continue
-
-                    open_positions.append(
-                        {
-                            "code": code,
-                            "strategy": sig["strategy"],
-                            "entry_date": today,
-                            "entry_price": entry_price,
-                            "quantity": qty,
-                            "stop": stop,
-                            "target": float(sig["target_price"]),
-                            "max_holding_days": int(sig["max_holding_days"]),
-                        }
-                    )
-                    held_codes.add(code)
-                    taken += 1
 
         # ---- 3. 時価評価 ------------------------------------------------
         unrealized = 0.0
