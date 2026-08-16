@@ -14,6 +14,7 @@
     hinotane backtest                 バックテスト
     hinotane walkforward              イン／アウトオブサンプル検証
     hinotane diagnose                 負けている原因を特定
+    hinotane research                 対照群と比べて敗因を実験で特定
     hinotane serve                    LINE Webhook サーバーを起動
 """
 
@@ -363,6 +364,14 @@ def cmd_walkforward(args, cfg, db) -> int:
     return 0
 
 
+def cmd_research(args, cfg, db) -> int:
+    """対照群と比べて、どの要素が効いていないのかを実験で特定する。"""
+    from .research import run_research
+
+    print(run_research(cfg, db, max_symbols=args.max_symbols, split=args.split))
+    return 0
+
+
 def cmd_diagnose(args, cfg, db) -> int:
     """負けている戦略の、どこが悪いのかを特定する。"""
     from .diagnose import diagnose
@@ -427,6 +436,12 @@ def build_parser() -> argparse.ArgumentParser:
     wf.add_argument("--split", type=float, default=0.6, help="前半（イン・サンプル）の割合")
     wf.add_argument("--max-symbols", type=int, default=600)
     wf.set_defaults(func=cmd_walkforward)
+
+    rs = sub.add_parser("research", help="対照群と比べて敗因を実験で特定")
+    rs.add_argument("--max-symbols", type=int, default=600)
+    rs.add_argument("--split", type=float, default=0.6,
+                    help="前半（実験に使う範囲）の割合。後半は封印される")
+    rs.set_defaults(func=cmd_research)
 
     dg = sub.add_parser("diagnose", help="戦略のどこが悪いのかを診断")
     dg.add_argument("--strategies", help="カンマ区切り。省略時は設定値")

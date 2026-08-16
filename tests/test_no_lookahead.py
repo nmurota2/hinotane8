@@ -673,3 +673,105 @@ def test_bootstrap_interval_is_deterministic_and_brackets_the_estimate(noise_cfg
     assert (lo, hi) == r.expectancy_ci(), "呼ぶたびに違う値では判定に使えない"
     assert lo <= r.expectancy_r <= hi, f"点推定 {r.expectancy_r} が区間 [{lo}, {hi}] の外"
     assert lo < hi
+
+
+# ---------------------------------------------------------------- 実験の枠組み
+
+
+def test_research_never_touches_the_holdout(noise_cfg, db, monkeypatch):
+    """実験が、封印してある後半のデータに触れていないこと。
+
+    同じデータで何十回も検定すれば、優位性が無くても偶然当たるものが出る。
+    それを避ける唯一の方法が「最後まで一度も見ていない期間を残すこと」。
+    実験がこっそり後半を使っていたら、その保険は無効になる。
+    """
+    from hinotane import research
+
+    _driftless_market(db, n_days=520)
+
+    seen_end: list = []
+    original = research.run_backtest
+
+    def spy(*args, **kwargs):
+        seen_end.append(kwargs.get("end"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(research, "run_backtest", spy)
+    text = research.run_research(noise_cfg, db, max_symbols=30)
+
+    assert seen_end, "実験が 1 つも走っていない"
+    assert all(e is not None for e in seen_end), (
+        "終了日を指定せずにバックテストを走らせています。後半のデータを使っています。"
+    )
+    assert len(set(seen_end)) == 1, "実験ごとに期間が違うと比較になりません"
+    assert "封印" in text
+
+
+def test_research_reports_how_many_times_it_tested(noise_cfg, db):
+    """検定回数と、そのぶん広げた信頼区間を必ず表示すること。"""
+    from hinotane.research import BATTERY, run_research
+
+    _driftless_market(db, n_days=520)
+    text = run_research(noise_cfg, db, max_symbols=30)
+
+    assert f"実験数   : {len(BATTERY)} 個" in text
+    assert "ボンフェローニ" in text
+    assert "② 選ぶ順を乱数に" in text, "対照群が結果表に出ていない"
+
+
+def test_random_pick_control_differs_only_in_ranking(noise_cfg, db):
+    """順位乱数の対照群が、本家と「選ぶ順」以外は同じであること。
+
+    エントリー条件まで変わってしまうと、差が何の寄与なのか分からなくなる。
+    """
+    import pandas as pd
+
+    from hinotane.indicators import enrich
+    from hinotane.strategies.base import get_strategy
+
+    _driftless_market(db, n_days=520)
+    bars = db.bars("10000", limit=520)
+    enriched = enrich(bars)
+
+    base = get_strategy("trend").evaluate(enriched)
+    ctrl = get_strategy("研究:順位乱数").evaluate(enriched)
+
+    pd.testing.assert_series_equal(base["entry"], ctrl["entry"], check_names=False)
+    pd.testing.assert_series_equal(base["stop_price"], ctrl["stop_price"], check_names=False)
+    assert not base["score"].equals(ctrl["score"]), "スコアが同じでは対照群にならない"
+
+    # 同じ入力なら何度計算しても同じ順位になること（比較の再現性）
+    again = get_strategy("研究:順位乱数").evaluate(enriched)
+    pd.testing.assert_series_equal(ctrl["score"], again["score"], check_names=False)
+
+
+def test_skips_are_counted_so_the_real_constraint_is_visible(noise_cfg, db):
+    """候補を見送った理由が集計され、本当の制約が見えること。
+
+    合成データで「順位づけを乱数にしても成績が 1 円も変わらない」が起きた。
+    一見すると「順位づけは無意味」という結論になるが、実際の原因は別だった:
+    日本株は 100 株単位でしか買えないため、候補の 75% が
+    「1銘柄あたりの投資上限を超えるので買えない」で弾かれていた。
+    **銘柄を選んでいたのは戦略ではなく、株価と資金量だった。**
+
+    この集計が無いと、成立していない比較から強い結論を出してしまう。
+    """
+    from dataclasses import replace as dc_replace
+
+    _rising_market(db)
+    # 1 銘柄あたりの上限を絞ると、単元株に届かない候補が増えるはず
+    tight = replace(
+        noise_cfg,
+        risk=dc_replace(noise_cfg.risk, max_position_pct=0.05),
+        screener=replace(noise_cfg.screener, strategies=["trend"]),
+    )
+    result = run_backtest(tight, db, label="単元株の制約", max_symbols=40)
+
+    assert result.skips, "見送り理由が集計されていない"
+    assert result.skips["単元株に届かない"] > 0, (
+        "1銘柄あたり5%まででは、ほとんどの銘柄が単元株に届かないはず。"
+        " 集計されていないと、この制約が成績の表から見えない。"
+    )
+    assert result.skips["採用"] == len(result.trades), (
+        "採用した件数と取引数が一致していない"
+    )

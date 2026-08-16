@@ -70,6 +70,10 @@ class BacktestResult:
     #: 同じ期間・同じ銘柄を等ウェイトで買い持ちした場合の資産推移。
     #: 「戦略のおかげで儲かったのか、相場が上げただけなのか」を切り分ける。
     benchmark_curve: pd.Series = field(default_factory=pd.Series)
+    #: 候補を見送った理由ごとの件数。
+    #: 「順位づけが効いていない」ように見えるとき、本当の原因が
+    #: 「そもそも買える候補が枠より少ない」ことがある。それを見分けるために要る。
+    skips: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------ 指標
 
@@ -275,6 +279,42 @@ def _equal_weight_curve(
     return curve.dropna()
 
 
+def _market_regime(
+    bars_by_code: dict[str, pd.DataFrame], codes: list[str], window: int = 200
+) -> pd.DataFrame:
+    """検証対象の銘柄を等ウェイトした市場指数と、その移動平均より上かどうか。
+
+    個別銘柄しか見ない戦略は「相場全体が崩れているのに買い続ける」を避けられない。
+    地合いを判定するには市場全体の系列が要るが、``Strategy.evaluate()`` は
+    1 銘柄ぶんの日足しか受け取らないので、ここで作って各銘柄の表に配っておく。
+
+    ⚠️ 先読みにならないこと:
+      * 対象銘柄は「期間先頭 60 本の売買代金」で選んでいる（後知恵ではない）
+      * t 日の指数は t 日までの終値だけで作る。移動平均も同様
+      * 判定した翌営業日の寄りで売買するので、t 日の終値を見て t 日に
+        エントリーすることはない
+    """
+    series = {
+        code: bars_by_code[code].set_index("date")["close"]
+        for code in codes
+        if code in bars_by_code
+    }
+    if not series:
+        return pd.DataFrame(columns=["date", "market_index", "market_above_ma"])
+    frame = pd.DataFrame(series).sort_index()
+    base = frame.apply(lambda s: s.dropna().iloc[0] if s.notna().any() else np.nan)
+    index = frame.div(base).replace([np.inf, -np.inf], np.nan).mean(axis=1, skipna=True)
+    ma = index.rolling(window, min_periods=window).mean()
+    return pd.DataFrame(
+        {
+            "date": index.index,
+            "market_index": index.to_numpy(),
+            # 移動平均が未確定の期間は False。ウォームアップ中は買わせない。
+            "market_above_ma": (index > ma).fillna(False).to_numpy(),
+        }
+    )
+
+
 def _build_signal_table(
     cfg: AppConfig, db: Database, strategy_names: list[str], max_symbols: int
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, str]]:
@@ -304,12 +344,16 @@ def _build_signal_table(
     strategies = [get_strategy(n) for n in strategy_names]
     rows: list[pd.DataFrame] = []
     prices: dict[str, pd.DataFrame] = {}
+    regime = _market_regime(bars_by_code, codes)
 
     for code in codes:
         bars = bars_by_code.get(code)
         if bars is None or len(bars) < sc.min_history_days:
             continue
         enriched = enrich(bars)
+        if not regime.empty:
+            enriched = enriched.merge(regime, on="date", how="left")
+            enriched["market_above_ma"] = enriched["market_above_ma"].fillna(False)
 
         liquid = enriched["turnover_ma20"] >= sc.min_turnover_jpy
         in_range = enriched["close"].between(sc.min_price, sc.max_price)
@@ -336,6 +380,7 @@ def _build_signal_table(
                         "score": hit["score"],
                         "max_holding_days": strategy.max_holding_days,
                         "trailing_atr_mult": strategy.trailing_atr_mult,
+                        "use_stop_exit": strategy.use_stop_exit,
                     }
                 )
             )
@@ -417,6 +462,11 @@ def run_backtest(
         cfg, db, strategy_names, max_symbols
     )
     table = table.copy()
+    if prebuilt is not None and not table.empty:
+        # 使い回しの表には他の戦略のシグナルも入っている。
+        # 表の作成（指標計算 × 全銘柄）が処理時間のほとんどを占めるので、
+        # 複数の戦略を比べるときは 1 回作って戦略ごとに絞るほうが速い。
+        table = table[table["strategy"].isin(strategy_names)]
 
     equity = cfg.risk.equity_jpy
     initial = equity
@@ -446,6 +496,18 @@ def run_backtest(
     open_positions: list[dict] = []
     trades: list[Trade] = []
     curve: list[tuple[date, float]] = []
+    # 候補を見送った理由の内訳。集計しないと「選別が効いている」のか
+    # 「そもそも選ぶ余地が無い」のか区別がつかない。
+    skips: dict[str, int] = {
+        "枠が埋まっていた": 0,
+        "1日の上限に達した": 0,
+        "すでに保有中": 0,
+        "その日の株価が無い": 0,
+        "損切り幅が取れない": 0,
+        "単元株に届かない": 0,
+        "資金が足りない": 0,
+        "採用": 0,
+    }
 
     lot = cfg.risk.lot_size
     slip = cfg.execution.slippage_pct
@@ -500,15 +562,22 @@ def run_backtest(
                 taken = 0
                 for _, sig in candidates.iterrows():
                     if len(open_positions) >= cfg.risk.max_open_positions:
+                        skips["枠が埋まっていた"] += len(candidates) - taken
                         break
                     if taken >= cfg.risk.max_signals_per_day:
+                        skips["1日の上限に達した"] += 1
                         break
                     code = sig["code"]
-                    if code in held_codes or today not in prices[code].index:
+                    if code in held_codes:
+                        skips["すでに保有中"] += 1
+                        continue
+                    if today not in prices[code].index:
+                        skips["その日の株価が無い"] += 1
                         continue
 
                     raw_open = _bar_price(prices[code], today, "open")
                     if raw_open is None:
+                        skips["その日の株価が無い"] += 1
                         continue
                     entry_price = raw_open * (1 + slip)
                     stop = float(sig["stop_price"])
@@ -520,6 +589,7 @@ def run_backtest(
                     # いることになり、本番では作れない建玉ができる。
                     intended_risk_per_share = float(sig["ref_price"]) - stop
                     if intended_risk_per_share <= 0:
+                        skips["損切り幅が取れない"] += 1
                         continue
 
                     # 資金は固定。本番の RiskManager は cfg.risk.equity_jpy を
@@ -534,6 +604,11 @@ def run_backtest(
                     if qty * entry_price > max_cost:
                         qty = int(math.floor(max_cost / entry_price / lot) * lot)
                     if qty < lot:
+                        # ⚠️ ここが効きすぎると、銘柄を「選んで」いない。
+                        # 日本株は 100 株単位なので、株価×100 が 1 銘柄あたりの
+                        # 投資上限を超えると、どんなに評価の高い候補でも買えない。
+                        # 結果として「買える銘柄」だけが残り、順位づけは素通りする。
+                        skips["単元株に届かない"] += 1
                         continue
 
                     # 建玉の合計が運用資金を超えないこと（本番 risk.py と同じ制約）。
@@ -541,6 +616,7 @@ def run_backtest(
                     # 信用取引相当の建て方になり、リターンが水増しされる。
                     committed = sum(p["entry_price"] * p["quantity"] for p in open_positions)
                     if committed + qty * entry_price > base:
+                        skips["資金が足りない"] += 1
                         continue
 
                     trail = sig.get("trailing_atr_mult")
@@ -563,6 +639,7 @@ def run_backtest(
                             "target": float(sig["target_price"]),
                             "max_holding_days": int(sig["max_holding_days"]),
                             "trailing_atr_mult": None if pd.isna(trail) else trail,
+                            "use_stop_exit": bool(sig.get("use_stop_exit", True)),
                             "highest": entry_price,
                             # 「翌営業日の寄りで売る」と決まった決済理由。
                             # 本番は引け後に判定して翌朝に成行を出すので、
@@ -572,6 +649,7 @@ def run_backtest(
                     )
                     held_codes.add(code)
                     taken += 1
+                    skips["採用"] += 1
 
         # ---- 2. 当日の値動きで決済を判定する（執行は翌営業日の寄り） --------
         #
@@ -588,7 +666,7 @@ def run_backtest(
             bar = prices[pos["code"]].loc[today]
 
             held = i - date_index[pos["entry_date"]]
-            if bar["low"] <= pos["stop"]:
+            if pos["use_stop_exit"] and bar["low"] <= pos["stop"]:
                 pos["pending_exit"] = "stop"
             elif bar["high"] >= pos["target"]:
                 pos["pending_exit"] = "target"
@@ -661,6 +739,7 @@ def run_backtest(
         trades=trades,
         equity_curve=equity_curve,
         benchmark_curve=_equal_weight_curve(prices, all_dates),
+        skips=skips,
     )
 
 
